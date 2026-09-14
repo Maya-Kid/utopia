@@ -126,6 +126,15 @@ pub async fn govern(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> {
     }
     state.emit_review(kb_id);
     let more = outcome?;
+    // 重复对之后是其余几档（0043）：合并先定下来，事实与冲突看到的才是合并之后的图
+    let queues = crate::queue_agent::Ctx {
+        state,
+        kb_id,
+        run_id: ctx.run_id,
+        client: &client,
+        settings: &settings,
+    };
+    let more = crate::queue_agent::run(&queues).await? || more;
 
     // 轮数用完还有积压：再排一个，下一轮从队头接着走
     if more {

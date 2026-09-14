@@ -683,13 +683,40 @@ pub struct NewDecision<'a> {
     pub calls: i32,
 }
 
+/// 重复对以外的一档（0043）：哪一档、做决定那一刻这一项的样子、这一步的参数与撤回要用的东西
+pub struct Target<'a> {
+    /// review | fact | conflict
+    pub kind: &'a str,
+    pub summary: Option<&'a str>,
+    pub detail: serde_json::Value,
+}
+
+impl Target<'_> {
+    fn review() -> Self {
+        Target {
+            kind: "review",
+            summary: None,
+            detail: serde_json::json!({}),
+        }
+    }
+}
+
 pub async fn record(pool: &PgPool, kb_id: Uuid, d: NewDecision<'_>) -> AppResult<Uuid> {
+    record_for(pool, kb_id, d, Target::review()).await
+}
+
+pub async fn record_for(
+    pool: &PgPool,
+    kb_id: Uuid,
+    d: NewDecision<'_>,
+    target: Target<'_>,
+) -> AppResult<Uuid> {
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO agent_decisions
             (id, kb_id, run_id, target_kind, target_id, action, confidence, reason,
-             precedents, status, merge_id, question, trace, calls)
-         VALUES ($1, $2, $3, 'review', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             precedents, status, merge_id, question, trace, calls, summary, detail)
+         VALUES ($1, $2, $3, $14, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16)",
     )
     .bind(id)
     .bind(kb_id)
@@ -704,6 +731,9 @@ pub async fn record(pool: &PgPool, kb_id: Uuid, d: NewDecision<'_>) -> AppResult
     .bind(d.question)
     .bind(d.trace)
     .bind(d.calls)
+    .bind(target.kind)
+    .bind(target.summary)
+    .bind(target.detail)
     .execute(pool)
     .await?;
     Ok(id)
@@ -821,6 +851,7 @@ pub async fn namesakes(
 
 const VIEW: &str = "SELECT d.id, d.run_id, d.target_kind, d.target_id, d.action, d.confidence,
         d.reason, d.precedents, d.status, d.merge_id, d.question, d.trace, d.calls,
+        d.summary, d.detail,
         d.created_at, d.decided_at,
         u.display_name AS decided_by_name,
         a.canonical_name AS \"left\", b.canonical_name AS \"right\"
@@ -1066,9 +1097,9 @@ pub async fn settle_by_merge(
     Ok(id)
 }
 
-/// 开关开着、队列里还有 agent 没看过的对的库：定时扫描用
+/// 开关开着、还有 agent 没看过的项的库：定时扫描用。重复对之外，事实与冲突两档也算（0043）
 pub async fn due(pool: &PgPool) -> AppResult<Vec<Uuid>> {
-    let ids = sqlx::query_scalar(&format!(
+    let mut ids: Vec<Uuid> = sqlx::query_scalar(&format!(
         "SELECT kb.id FROM knowledge_bases kb
          WHERE kb.governance AND EXISTS (
              SELECT 1 FROM resolution_reviews rr
@@ -1076,6 +1107,14 @@ pub async fn due(pool: &PgPool) -> AppResult<Vec<Uuid>> {
     ))
     .fetch_all(pool)
     .await?;
+    let governed: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM knowledge_bases WHERE governance")
+        .fetch_all(pool)
+        .await?;
+    for kb_id in governed {
+        if !ids.contains(&kb_id) && crate::queue_agent::has_backlog(pool, kb_id).await? {
+            ids.push(kb_id);
+        }
+    }
     Ok(ids)
 }
 
