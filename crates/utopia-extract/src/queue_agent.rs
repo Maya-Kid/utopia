@@ -141,7 +141,9 @@ pub fn fact_messages(items: &[FactQuestion]) -> Vec<ChatMessage> {
          \n\
          Actions:\n\
          - \"confirm\": the evidence states this fact — the same subject, relation, value and \
-           dates. A value written in a table, a list or an amendment's new column is stated.\n\
+           dates. A value written in a table, a list or an amendment's new column is stated. \
+           A fact is judged over its dates: text that ends a value on a date (deleted, \
+           terminated, replaced) states that the value held until then.\n\
          - \"reject\": the evidence does not say it, says something else, or attaches it to \
            another subject.\n\
          - \"unsure\": the evidence genuinely points both ways; say what a person should check.\n\
