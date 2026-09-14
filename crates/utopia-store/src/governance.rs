@@ -926,6 +926,61 @@ pub async fn lock(pool: &PgPool, kb_id: Uuid, ids: &[Uuid]) -> AppResult<()> {
     Ok(())
 }
 
+/// 一个库同一时刻只跑一个治理任务的凭据。
+///
+/// 任务开头的 [`release_locks`] 假定没有别的任务在裁：两个任务并排跑，后开始的那个一上来
+/// 就把前一个正裁着的对放掉，两边裁同一批、写重复的决定（`agent_decisions_open_idx`
+/// 冲突），模型调用也翻倍。抽完一篇就排一个治理任务（0043）之后，一批文档陆续抽完，
+/// 同一个库能并排跑上十个。
+///
+/// 会话级咨询锁挂在一条专用连接上。正常结束走 [`RunGuard::release`] 放锁、连接回池；
+/// 任务半路被丢掉（出错、取消）时 `Drop` 把连接从池里摘下来关掉，锁跟着连接一起没——
+/// 带着锁回池，这个库的治理就再也跑不起来
+pub struct RunGuard {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    kb_id: Uuid,
+}
+
+fn run_key(kb_id: Uuid) -> String {
+    format!("govern:{kb_id}")
+}
+
+/// 拿这个库的治理锁；已经有任务拿着就返回 None，不等
+pub async fn claim_run(pool: &PgPool, kb_id: Uuid) -> AppResult<Option<RunGuard>> {
+    let mut conn = pool.acquire().await?;
+    let (held,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+        .bind(run_key(kb_id))
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(held.then_some(RunGuard {
+        conn: Some(conn),
+        kb_id,
+    }))
+}
+
+impl RunGuard {
+    pub async fn release(mut self) {
+        let Some(mut conn) = self.conn.take() else {
+            return;
+        };
+        let unlocked = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(run_key(self.kb_id))
+            .execute(&mut *conn)
+            .await;
+        if unlocked.is_err() {
+            drop(conn.detach());
+        }
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
 /// 任务开始与结束时放开所有锁：一轮中途出错、开关关掉，都不能把对锁死
 pub async fn release_locks(pool: &PgPool, kb_id: Uuid) -> AppResult<u64> {
     let n = sqlx::query(
