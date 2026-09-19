@@ -342,3 +342,7 @@ async fn align_types_locked(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "alignment_version_repro.rs"]
+mod version_repro;
