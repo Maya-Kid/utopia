@@ -346,15 +346,18 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
         .await?
         .as_deref()
         == Some("statements");
+    // settings 有就传：推送路径不问对话模型，但名字向量的嵌入模型（#877）仍从它来
     let settings = utopia_store::settings::get(&state.pool, kb.workspace_id).await?;
-    let (settings, client) = if pushed {
-        (None, None)
+    let client = if pushed {
+        None
     } else {
-        let settings =
-            settings.ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
-        let client = llm_util::chat_client(&settings)
+        let settings = settings
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
-        (Some(settings), Some(client))
+        Some(
+            llm_util::chat_client(settings)
+                .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?,
+        )
     };
 
     // 所有权凭证：重抽会自增 epoch，任务据此察觉自己已被接管（见 `run_open` 的分块循环）

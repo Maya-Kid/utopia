@@ -224,7 +224,7 @@ async fn place(
 /// `await_nod`：这是记忆日志（0015）——陈述不直接落库，原样进待确认表，人点头时才成为开放陈述。
 /// `proposer`：那句话是谁、经哪枚令牌说的（0026），随待确认项一起记。
 /// `pushed`：块本身就是契约（0054 的 `statements` 来源）——不建提示词、不问模型，直接解析；
-/// 这时 `settings` 与 `client` 可以为 None，其余一步不变
+/// 这时 `client`（对话模型）为 None；`settings` 有就照传，名字向量的嵌入模型从它来。其余一步不变
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_open(
     state: &AppState,
@@ -270,7 +270,7 @@ pub(crate) async fn run_open(
 
     // 名字向量的嵌入客户端（0041 决定 3 通道 2）。没配嵌入模型就是 None：召回退回
     // 字面相等，抽取照常
-    let embed = crate::llm_util::embed_client(settings);
+    let embed = settings.and_then(crate::llm_util::embed_client);
     for chunk in chunks.iter() {
         // 被接管则安静退场（重抽自增 epoch）：检查放在调用模型之前
         if utopia_store::documents::extract_epoch(pool, document_id).await? != my_epoch {
@@ -400,8 +400,8 @@ pub(crate) async fn run_open(
         // 名字向量（0041 决定 3 通道 2）：这一块里有名字的东西，名字字符串各算一条，
         // 消解时拿它在同库的名字向量里找近邻。一块一批；算不出来（端点抖了）不拦抽取，
         // 只是这一块少一条召回通道
-        let name_vecs: HashMap<String, Vec<f32>> = match &embed {
-            Some(client) => {
+        let name_vecs: HashMap<String, Vec<f32>> = match (settings, &embed) {
+            (Some(settings), Some(client)) => {
                 let mut wanted: Vec<(String, String)> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
                 for e in &extraction.entities {
@@ -412,7 +412,7 @@ pub(crate) async fn run_open(
                 }
                 embed_names(state, settings, client, &wanted).await
             }
-            None => HashMap::new(),
+            _ => HashMap::new(),
         };
 
         // ---- 东西：有名字的走身份消解，被描述的建成没有名字事实的实体 ----
@@ -905,7 +905,7 @@ pub(crate) async fn run_open(
 
     // 名字向量：这篇新写的名字事实，向量补上（0041 决定 3 通道 2）。算不出来只记日志——
     // 文档已经抽完了，不能因为召回的辅助数据没算而把它标成 failed
-    if let Some(client) = &embed {
+    if let (Some(settings), Some(client)) = (settings, &embed) {
         match embed_pending_names(state, settings, client, kb_id).await {
             Ok(n) if n > 0 => tracing::info!(%document_id, names = n, "名字向量已补"),
             Ok(_) => {}
