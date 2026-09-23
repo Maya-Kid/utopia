@@ -475,6 +475,11 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route("/kbs/{id}/ingest", post(sources_routes::ingest))
         // api 来源推送：来源专属密钥认证（Bearer），无会话
         .route("/sources/{source_id}/ingest", post(sources_routes::push))
+        // 推陈述而不是推文档（0054）：请求体就是开放抽取契约，抽取不问模型
+        .route(
+            "/sources/{source_id}/statements",
+            post(sources_routes::push_statements),
+        )
         .route(
             "/kbs/{id}/sources/{source_id}/token",
             get(sources_routes::get_token),

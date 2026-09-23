@@ -222,17 +222,20 @@ async fn place(
 }
 
 /// `await_nod`：这是记忆日志（0015）——陈述不直接落库，原样进待确认表，人点头时才成为开放陈述。
-/// `proposer`：那句话是谁、经哪枚令牌说的（0026），随待确认项一起记
+/// `proposer`：那句话是谁、经哪枚令牌说的（0026），随待确认项一起记。
+/// `pushed`：块本身就是契约（0054 的 `statements` 来源）——不建提示词、不问模型，直接解析；
+/// 这时 `settings` 与 `client` 可以为 None，其余一步不变
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_open(
     state: &AppState,
     doc: &Document,
     kb: &KnowledgeBase,
-    settings: &LlmSettings,
-    client: &utopia_llm::LlmClient,
+    settings: Option<&LlmSettings>,
+    client: Option<&utopia_llm::LlmClient>,
     my_epoch: i32,
     proposer: Proposer,
     await_nod: bool,
+    pushed: bool,
 ) -> anyhow::Result<()> {
     let pool = &state.pool;
     let document_id = doc.id;
@@ -288,39 +291,53 @@ pub(crate) async fn run_open(
             .as_ref()
             .filter(|(id, _)| *id != chunk.id)
             .map(|(_, text)| text.as_str());
-        let messages =
-            utopia_extract::open::build_open_messages(&doc.filename, &known, opening, &chunk.text);
-        // 温度 0：照抄原文的活不该靠采样。端点缺省 1.0 时同一块两次回复密度差三倍
-        let reply = match chat_retrying_rate_limits_at(
-            state,
-            settings,
-            client,
-            &messages,
-            Some(0.0),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%document_id, seq = chunk.seq, error = %e, "开放抽取调用失败，跳过该分块");
-                drop_signal(
-                    state,
-                    kb_id,
-                    document_id,
-                    reason::CHUNK_UNEXTRACTED,
-                    "调用失败，这一块没有进图",
-                    Some(&format!("#{}：{e}", chunk.seq)),
-                )
-                .await;
-                unextracted.push((chunk.seq, format!("调用失败：{e}")));
-                continue;
-            }
+        // 推送来的陈述：块就是契约，解析它而不是问模型（0054）。下面从解析起一步不变
+        let (reply_text, cut_by_ceiling) = if pushed {
+            (chunk.text.clone(), false)
+        } else {
+            let (settings, client) = match (settings, client) {
+                (Some(s), Some(c)) => (s, c),
+                _ => anyhow::bail!("Chat model not configured; cannot extract"),
+            };
+            let messages = utopia_extract::open::build_open_messages(
+                &doc.filename,
+                &known,
+                opening,
+                &chunk.text,
+            );
+            // 温度 0：照抄原文的活不该靠采样。端点缺省 1.0 时同一块两次回复密度差三倍
+            let reply = match chat_retrying_rate_limits_at(
+                state,
+                settings,
+                client,
+                &messages,
+                Some(0.0),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(%document_id, seq = chunk.seq, error = %e, "开放抽取调用失败，跳过该分块");
+                    drop_signal(
+                        state,
+                        kb_id,
+                        document_id,
+                        reason::CHUNK_UNEXTRACTED,
+                        "调用失败，这一块没有进图",
+                        Some(&format!("#{}：{e}", chunk.seq)),
+                    )
+                    .await;
+                    unextracted.push((chunk.seq, format!("调用失败：{e}")));
+                    continue;
+                }
+            };
+            tracing::debug!(%document_id, seq = chunk.seq, reply = %reply.text, "开放抽取的原始回复");
+            // 端点说它是撞上 token 上限停的。解析器只看得见 JSON 少了尾巴，看不见
+            // 少的原因，所以这句话得从回复里带过来（#760）
+            let cut_by_ceiling = reply.hit_token_ceiling();
+            (reply.text, cut_by_ceiling)
         };
-        tracing::debug!(%document_id, seq = chunk.seq, reply = %reply.text, "开放抽取的原始回复");
-        // 端点说它是撞上 token 上限停的。解析器只看得见 JSON 少了尾巴，看不见
-        // 少的原因，所以这句话得从回复里带过来（#760）
-        let cut_by_ceiling = reply.hit_token_ceiling();
-        let extraction = match utopia_extract::open::parse_open_response(&reply.text) {
+        let extraction = match utopia_extract::open::parse_open_response(&reply_text) {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(%document_id, seq = chunk.seq, error = %e, hit_token_ceiling = cut_by_ceiling, "开放抽取回复解析失败，跳过该分块");
