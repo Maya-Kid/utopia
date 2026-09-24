@@ -1,0 +1,45 @@
+{
+  "about": "A fixed observation log for the premise replay (#875). Two objects, two places. The step S_A (pick cup-7 from the desk) is modelled as a typing rule on cup-7's location; S_B (pick box-3 from the shelf) reads box-3's own location and is the unrelated control. observed_at is world time (the envelope's doc_time and the statement's `when` words); arrive_at is the replay clock, the moment the adapter treats as now after the event.",
+  "entities": {
+    "A": { "name": "cup-7", "kind": "cup" },
+    "B": { "name": "box-3", "kind": "box" }
+  },
+  "places": ["desk", "shelf"],
+  "steps": {
+    "S_A": {
+      "rule": "S_A pick cup-7 from the desk",
+      "class": "step_sa_ready",
+      "subject": "A",
+      "attribute": "location",
+      "phrase": "is on",
+      "place": "desk"
+    },
+    "S_B": {
+      "rule": "S_B pick box-3 from the shelf",
+      "class": "step_sb_ready",
+      "subject": "B",
+      "attribute": "location",
+      "phrase": "is on",
+      "place": "shelf"
+    }
+  },
+  "freshness": {
+    "owner": "adapter",
+    "max_evidence_age_minutes": 15,
+    "note": "An explicit adapter-side policy, not a ledger TTL: a premise whose newest evidence is older than this pauses the step for reobservation."
+  },
+  "events": [
+    { "id": "E1-A", "scenario": "initial", "subject": "A", "phrase": "is on", "value": "desk", "observed_at": "2026-09-23T08:00:00Z", "arrive_at": "2026-09-23T08:00:30Z" },
+    { "id": "E1-B", "scenario": "initial", "subject": "B", "phrase": "is on", "value": "shelf", "observed_at": "2026-09-23T08:00:00Z", "arrive_at": "2026-09-23T08:00:30Z" },
+    { "id": "E2-A", "scenario": "duplicate", "repeat": "E1-A", "arrive_at": "2026-09-23T08:01:00Z" },
+    { "id": "E3-A", "scenario": "occlusion", "subject": "A", "phrase": "visibility", "value": "occluded", "qualifiers": { "sensor": "head_camera" }, "observed_at": "2026-09-23T08:05:00Z", "arrive_at": "2026-09-23T08:05:30Z" },
+    { "id": "E4-A", "scenario": "move", "subject": "A", "phrase": "is on", "value": "shelf", "observed_at": "2026-09-23T08:10:00Z", "arrive_at": "2026-09-23T08:10:30Z" },
+    { "id": "E5-A", "scenario": "late_old", "subject": "A", "phrase": "is on", "value": "desk", "observed_at": "2026-09-23T07:50:00Z", "arrive_at": "2026-09-23T08:12:00Z" },
+    { "id": "E6-A", "scenario": "same_content_new_time", "subject": "A", "doc_time": "2026-09-23T08:20:00Z", "arrive_at": "2026-09-23T08:20:30Z" },
+    { "id": "E7-B", "scenario": "explicit_end", "subject": "B", "tombstone": true, "arrive_at": "2026-09-23T08:30:00Z" }
+  ],
+  "identity": {
+    "per_observation": "every event is its own external_id (obs-<event id>); E6 re-pushes E4's content twice: once under E4's id with a later doc_time, once under a new id",
+    "per_object": "one external_id per object (its name), as suggested in the #875 reply; every push replaces that object's payload and records a version; E6 re-pushes the current payload with a later doc_time"
+  }
+}
