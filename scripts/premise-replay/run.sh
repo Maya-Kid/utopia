@@ -17,7 +17,12 @@ OUT="${REPLAY_OUT:-$PWD/target/premise-replay/$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT" "$OUT/restart"
 DATA_DIR="$(mktemp -d)"
 SERVER_PID=""
+HARNESS_PID=""
 cleanup() {
+  if [ -n "$HARNESS_PID" ]; then
+    kill "$HARNESS_PID" 2>/dev/null || true
+    wait "$HARNESS_PID" 2>/dev/null || true
+  fi
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -26,15 +31,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 连接串拆成 libpq 的环境变量：口令不进命令行，也不进日志
-eval "$(node -e '
-  const u = new URL(process.env.REPLAY_DATABASE_URL);
-  const q = (s) => JSON.stringify(s);
-  console.log(`export PGHOST=${q(u.hostname)} PGPORT=${q(u.port || "5432")} PGUSER=${q(decodeURIComponent(u.username))} PGPASSWORD=${q(decodeURIComponent(u.password))} PGDATABASE=${q(u.pathname.slice(1))}`);
-')"
-tables="$(psql -X -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")"
+# Decode credentials in Node and pass them straight to libpq, without eval.
+tables="$(node scripts/premise-replay/pg-env.mjs -X -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'")"
 if [ "$tables" != "0" ]; then
-  echo "refusing to run: $PGDATABASE already has $tables tables; point REPLAY_DATABASE_URL at an empty database" >&2
+  echo "refusing to run: the requested database already has $tables tables; point REPLAY_DATABASE_URL at an empty database" >&2
   exit 2
 fi
 

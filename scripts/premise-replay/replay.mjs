@@ -15,6 +15,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { pgEnvironment } from "./pg-env.mjs";
+import { EventStream } from "./event-stream.mjs";
+import { verifySummary } from "./verify.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const BASE = process.env.REPLAY_BASE || "http://127.0.0.1:18751";
@@ -56,7 +59,7 @@ async function http(method, url, { body, bearer, ok = [] } = {}) {
     payload = typeof body === "string" ? body : JSON.stringify(body);
   }
   const started = Date.now();
-  const r = await fetch(BASE + url, { method, headers, body: payload });
+  const r = await fetch(BASE + url, { method, headers, body: payload, signal: AbortSignal.timeout(30000) });
   const text = await r.text();
   let json = null;
   try {
@@ -87,17 +90,7 @@ async function mcp(kb, name, args) {
 }
 
 // 口令只进子进程环境，从不进命令行和日志
-const dbUrl = process.env.REPLAY_DATABASE_URL ? new URL(process.env.REPLAY_DATABASE_URL) : null;
-const pgEnv = dbUrl
-  ? {
-      PATH: process.env.PATH,
-      PGHOST: dbUrl.hostname,
-      PGPORT: dbUrl.port || "5432",
-      PGUSER: decodeURIComponent(dbUrl.username),
-      PGPASSWORD: decodeURIComponent(dbUrl.password),
-      PGDATABASE: dbUrl.pathname.slice(1),
-    }
-  : null;
+const pgEnv = process.env.REPLAY_DATABASE_URL ? pgEnvironment(process.env.REPLAY_DATABASE_URL) : null;
 function sql(q) {
   if (!pgEnv) throw new Error("REPLAY_DATABASE_URL is needed for diagnostics and the fixture");
   return execFileSync("psql", ["-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", q], {
@@ -485,63 +478,49 @@ function lineage(st) {
  * 决定是确定性的三种：continue / pause_reobserve / wait_confirmation，附理由。它不执行动作；
  * 这里也没有一致快照或版本校验可用，所以「检查完到执行前」之间状态仍可能变——这一点记在输出里。
  */
+const activeAdapters = new Set();
 class Adapter {
   constructor(st) {
     this.st = st;
+    activeAdapters.add(this);
     this.plan = {};
     this.events = [];
-    this.abort = null;
+    this.now = EV["E1-A"].arrive_at;
+    this.liveReads = 0;
+    this.latest = null;
+    this.stream = new EventStream({
+      refresh: async () => {
+        this.latest = await this.resync(this.now, "sse");
+        this.liveReads += 1;
+      },
+      event: ({ kind, data }) => {
+        this.events.push({ ms: Date.now() - T0, kind, data });
+        rec("sse.event", { kb: this.st.id, event: kind, data });
+      },
+      error: (error) => rec("sse.error", { kb: this.st.id, error: String(error) }),
+      closed: () => { this.connected = false; rec("sse.closed", { kb: this.st.id }); },
+    });
     this.connected = false;
     this.connects = 0;
     this.maxAgeMs = LOG.freshness.max_evidence_age_minutes * 60000;
   }
 
   async connect() {
-    this.abort = new AbortController();
-    const res = await fetch(`${BASE}${API}/kbs/${this.st.id}/events`, {
-      headers: { authorization: `Bearer ${JWT}`, accept: "text/event-stream" },
-      signal: this.abort.signal,
+    await this.stream.connect(`${BASE}${API}/kbs/${this.st.id}/events`, {
+      authorization: `Bearer ${JWT}`, accept: "text/event-stream",
     });
-    if (!res.ok) throw new Error(`sse ${res.status}`);
     this.connected = true;
     this.connects += 1;
     rec("sse.connected", { kb: this.st.id, connects: this.connects });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    (async () => {
-      let buf = "";
-      try {
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          let cut;
-          while ((cut = buf.indexOf("\n\n")) >= 0) {
-            const frame = buf.slice(0, cut);
-            buf = buf.slice(cut + 2);
-            const kind = frame.match(/^event: ?(.*)$/m)?.[1];
-            const data = frame.match(/^data: ?(.*)$/m)?.[1];
-            if (!kind) continue;
-            const ev = { ms: Date.now() - T0, kind, data };
-            this.events.push(ev);
-            rec("sse.event", { kb: this.st.id, event: kind, data });
-          }
-        }
-      } catch (e) {
-        if (e.name !== "AbortError") rec("sse.error", { kb: this.st.id, error: String(e) });
-      } finally {
-        this.connected = false;
-        rec("sse.closed", { kb: this.st.id });
-      }
-    })();
   }
 
-  disconnect() {
-    this.abort?.abort();
+  async disconnect() {
+    await this.stream.disconnect();
   }
 
   /** 重连直到连上（有限次数），连上立刻整体重读：通知不补发，丢了什么只能靠重读发现 */
   async reconnect(now) {
+    this.now = now;
     for (let i = 0; i < 60; i++) {
       try {
         await this.connect();
@@ -661,6 +640,7 @@ class Adapter {
 // ---------------------------------------------------------------------------
 
 async function stage(st, adapter, eventId, name, now, extra = {}) {
+  adapter.now = now;
   const decisions = {};
   const states = {};
   for (const step of Object.keys(LOG.steps)) {
@@ -730,6 +710,7 @@ async function runStrategy(workspace, strategy) {
   const e1 = [EV["E1-A"], EV["E1-B"]];
   for (const ev of e1) await pushEvent(ev);
   let now = EV["E1-A"].arrive_at;
+  adapter.now = now;
   await stage(st, adapter, "E1", "after_push", now);
   await bootstrapAlignment(st);
   await stage(st, adapter, "E1", "after_projection", now);
@@ -741,6 +722,7 @@ async function runStrategy(workspace, strategy) {
 
   // ---- E2 同一份载荷再推一遍
   now = EV["E2-A"].arrive_at;
+  adapter.now = now;
   const dup = await pushEvent(EV["E2-A"]);
   const docs = sqlRows(`SELECT count(*)::int AS documents,
                                (SELECT count(*)::int FROM document_versions v JOIN documents d ON d.id = v.document_id WHERE d.kb_id = ${lit(st.id)}) AS versions,
@@ -752,6 +734,7 @@ async function runStrategy(workspace, strategy) {
 
   // ---- E3 遮挡：一条「看不见」的陈述，没有 location
   now = EV["E3-A"].arrive_at;
+  adapter.now = now;
   await pushEvent(EV["E3-A"]);
   await stage(st, adapter, "E3", "after_push", now);
   await reproject(st, "after occlusion");
@@ -759,9 +742,10 @@ async function runStrategy(workspace, strategy) {
   await stage(st, adapter, "E3", "after_derive", now);
 
   // ---- E4 移动。SSE 在这之前断开：这一段的通知全部丢失，重连之后只能靠重读发现
-  adapter.disconnect();
+  await adapter.disconnect();
   rec("sse.dropped_on_purpose", { kb: st.id, before: "E4" });
   now = EV["E4-A"].arrive_at;
+  adapter.now = now;
   const moved = await pushEvent(EV["E4-A"]);
   await stage(st, adapter, "E4", "after_push", now);
   const proj = await reproject(st, "after move");
@@ -807,6 +791,7 @@ async function runStrategy(workspace, strategy) {
 
   // ---- E5 晚到的旧观察（t0 早于 t1），在移动之后才送到
   now = EV["E5-A"].arrive_at;
+  adapter.now = now;
   await pushEvent(EV["E5-A"]);
   await stage(st, adapter, "E5", "after_push", now);
   await reproject(st, "after late observation");
@@ -832,6 +817,7 @@ async function runStrategy(workspace, strategy) {
 
   // ---- E6 内容相同、doc_time 变了
   now = EV["E6-A"].arrive_at;
+  adapter.now = now;
   const same = current.A;
   const e6 = [];
   if (strategy === "per_observation") {
@@ -846,12 +832,22 @@ async function runStrategy(workspace, strategy) {
 
   // ---- E7 明确结束 B 的那条观察：墓碑 → 清理
   now = EV["E7-B"].arrive_at;
+  adapter.now = now;
   const bId = strategy === "per_object" ? LOG.entities.B.name : "obs-E1-B";
   const tomb = await pushEvent(EV["E7-B"], { external_id: bId, deleted: true, body: null, observedAt: null });
   await stage(st, adapter, "E7", "after_tombstone", now, { action: tomb.action });
+  const eventsBeforeCleanup = adapter.events.length;
+  const readsBeforeCleanup = adapter.liveReads;
   const cleaned = await http("POST", `${API}/kbs/${st.id}/sources/${st.source}/missing/cleanup`);
   st.interventions.push({ kind: "person", what: "clean up missing documents", via: "POST sources/{id}/missing/cleanup", result: cleaned.json });
   rec("intervention.person", { kb: st.id, what: "missing_cleanup", ...cleaned.json });
+  // No explicit resync or stage read here: only a received SSE hint can satisfy this.
+  await until("SSE-triggered read observes cleanup retraction", async () => ({
+    done: adapter.events.length > eventsBeforeCleanup && adapter.liveReads > readsBeforeCleanup
+      && adapter.latest?.S_B?.s?.holds === false,
+  }), { kb: st.id });
+  st.liveRefresh = { events: adapter.events.length - eventsBeforeCleanup, decisions: adapter.latest };
+  rec("adapter.live_refresh_verified", { kb: st.id, ...st.liveRefresh });
   await stage(st, adapter, "E7", "after_cleanup", now, { cleanup: cleaned.json });
   await derive(st);
   await stage(st, adapter, "E7", "after_cleanup_derive", now);
@@ -862,7 +858,7 @@ async function runStrategy(workspace, strategy) {
                           OR payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id = ${lit(st.id)})
                       GROUP BY kind, status ORDER BY kind, status`);
   st.sse = { connects: adapter.connects, events: adapter.events.length, kinds: [...new Set(adapter.events.map((e) => e.kind))] };
-  adapter.disconnect();
+  await adapter.disconnect();
   return st;
 }
 
@@ -931,6 +927,7 @@ async function main() {
     stages: st.stages,
     twoAxes: st.twoAxes,
     reconnect: st.reconnect,
+    liveRefresh: st.liveRefresh,
     restart: st.restart,
     lineage: { initial: st.lineageInitial, afterMove: st.lineageAfterMove, final: st.lineageFinal },
     jobs: st.jobs,
@@ -938,6 +935,9 @@ async function main() {
     scheduler: st.scheduler,
   }));
   fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 2));
+  const verification = verifySummary(summary);
+  fs.writeFileSync(path.join(OUT, "verification.json"), JSON.stringify(verification, null, 2));
+  rec("verification", verification);
   rec("end", {});
   say(`done: ${path.join(OUT, "summary.json")}`);
 }
@@ -948,4 +948,7 @@ main()
     console.error(e);
     process.exitCode = 1;
   })
-  .finally(() => traceFile.end());
+  .finally(async () => {
+    await Promise.allSettled([...activeAdapters].map((a) => a.disconnect()));
+    traceFile.end();
+  });

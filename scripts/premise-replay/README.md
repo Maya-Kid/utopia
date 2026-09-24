@@ -21,7 +21,22 @@ REPLAY_DATABASE_URL=postgres://user:pass@host:5432/empty_db scripts/premise-repl
 十五分钟）。
 
 结果：`trace.jsonl`（每一次推送、介入、SSE 事件、每一站的读数，原始证据）、`summary.json`
-（按库汇总）、`server.log`。
+（按库汇总）、`verification.json`（行为断言通过后才生成）、`server.log`。
+回放会断言初始前提、重复推送、遮挡、移动、无关步骤、历史终点、重连、清理及 SSE 自动重读；
+行为偏离预期或缺少任一必需阶段会以非零状态退出。已知缺口也作为当前行为明确断言，
+不表示它们已经修好，也不表示无需人工的端到端闭环成立。
+
+不连数据库的运行时回归：
+
+```bash
+node --test scripts/premise-replay/runtime.test.mjs
+```
+
+独立复核某次完整回放（包括清理后的自动 SSE 重读证据）：
+
+```bash
+node scripts/premise-replay/verify.mjs /absolute/path/to/summary.json
+```
 
 ## 日志与步骤
 
@@ -53,8 +68,10 @@ MCP 读取都是真实代码路径与真实 worker。对齐链上需要模型的
 
 ## 读取适配器
 
-`replay.mjs` 里的 `Adapter` 只读不写：SSE 当作「该重读了」的提示，连上、断开重连、服务重启
-之后都先整体重读；决定只从重读到的权威状态里算（MCP `entity_facts`、REST 实体面板与证明、
+`replay.mjs` 里的 `Adapter` 只读不写：SSE 事件自动触发整体重读，突发事件合并，读取期间
+若又收到事件则补读一次；首次连接和显式重连同样重读。回放驱动断开、重连和服务重启，
+没有实现常驻进程的自动重连循环。清理后的验收等待 SSE 回调自行读到撤回，不调用手工重读。
+决定只从重读到的权威状态里算（MCP `entity_facts`、REST 实体面板与证明、
 Review 队列）。每个步骤给出 `continue`、`pause_reobserve` 或 `wait_confirmation` 之一和理由。
 新鲜度是适配器自己的显式策略（`observations.json` 的 `freshness`），不是账本的 TTL。它不执行
 任何动作；这里也没有一致快照或版本校验，「检查完到执行前」之间状态仍可能变。
