@@ -245,7 +245,7 @@ async function awaitModelless(st, kind) {
     },
     { timeoutMs: 120000, everyMs: 500, kb: st.id },
   );
-  rec("gap.modelless_job", { kb: st.id, kind, job: w.j, waitedMs: w.waitedMs });
+  rec("gap.modelless_job", { kb: st.id, job_kind: kind, job: w.j, waitedMs: w.waitedMs });
   return w.j;
 }
 
@@ -342,7 +342,7 @@ async function decidePhrase(st, bindingId, why) {
     },
     { timeoutMs: 60000, kb: st.id },
   );
-  const out = { job, status: w.j.status, attempts: w.j.attempts, last_error: w.j.last_error, ms: Date.now() - started };
+  const out = { job, status: w.j.status, attempts: w.j.attempts, last_error: w.j.last_error, call_ms: Date.now() - started };
   st.interventions.push({ kind: "person", what: `phrase binding ${bindingId} -> location (${why})`, via: "POST review/alignment/phrases", job: out });
   rec("intervention.person", { kb: st.id, what: "phrase_binding", why, binding: bindingId, ...out });
   return out;
@@ -357,14 +357,14 @@ async function reproject(st, why) {
 async function reconcile(st) {
   const r = await http("POST", `${API}/kbs/${st.id}/ontology/relation-types/${st.location}/reconcile`);
   st.interventions.push({ kind: "person", what: "reconcile location timelines", via: "POST ontology/relation-types/{id}/reconcile", result: r.json });
-  rec("intervention.person", { kb: st.id, what: "reconcile", ms: r.ms, ...r.json });
+  rec("intervention.person", { kb: st.id, what: "reconcile", call_ms: r.ms, ...r.json });
   return { ...r.json, ms: r.ms };
 }
 
 async function derive(st) {
   const r = await http("POST", `${API}/kbs/${st.id}/rules/run`);
   st.interventions.push({ kind: "person", what: "run rules now", via: "POST rules/run", result: r.json });
-  rec("intervention.person", { kb: st.id, what: "rules_run", ms: r.ms, ...r.json });
+  rec("intervention.person", { kb: st.id, what: "rules_run", call_ms: r.ms, ...r.json });
   return { ...r.json, ms: r.ms };
 }
 
@@ -524,7 +524,7 @@ class Adapter {
             if (!kind) continue;
             const ev = { ms: Date.now() - T0, kind, data };
             this.events.push(ev);
-            rec("sse.event", { kb: this.st.id, kind, data });
+            rec("sse.event", { kb: this.st.id, event: kind, data });
           }
         }
       } catch (e) {
