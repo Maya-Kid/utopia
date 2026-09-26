@@ -74,7 +74,7 @@ export const en = {
       "The model endpoint gave no usable answer. Check its address under Administration → Models.",
     model_rejected:
       "The model endpoint refused the request. Check the model settings under Administration → Models.",
-    // 重答（#936）被拒。`answer_running` 也是生成中又来一个新问题时的那个 409（#934）
+    // 重答（#936）被拒。生成中又来一个新问题（#961）也是 409；两边用同一个 code
     answer_running: "An answer is still being written in this conversation. Wait for it to finish.",
     retry_answered: "That question already has an answer, or the conversation went on after it.",
     retry_not_question: "Only a question can be answered again.",

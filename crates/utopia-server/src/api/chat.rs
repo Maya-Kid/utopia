@@ -182,7 +182,7 @@ async fn retry_question(
     })
 }
 
-/// 这场对话里正有一个回答在写。#934 给「生成中又来一个新问题」的 409 用同一个 code
+/// 这场对话里正有一个回答在写。#961 给「生成中又来一个新问题」的也是 409；后落地的那个沿用先落地的 code
 fn answer_running() -> AppError {
     AppError::CodedConflict {
         code: "answer_running",
