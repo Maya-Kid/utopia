@@ -829,25 +829,20 @@ pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<String> {
         .flexible(true)
         .has_headers(false)
         .from_reader(decoded.as_bytes());
-    let mut rows: Vec<GridRow> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for (i, record) in reader.records().enumerate() {
         if i >= 10_000 {
             break;
         }
         let record = record?;
-        rows.push(record.iter().map(|s| (s.to_string(), 1, 0)).collect());
+        rows.push(record.iter().map(str::to_string).collect());
     }
     // 第一条记录是列头（csv 的惯例）；渲染不出表时退回竖线分隔的行
-    Ok(match crate::table::render_grid(&rows, true) {
+    Ok(match crate::table::render_records(&rows) {
         Some(md) => md + "\n",
         None => {
             rows.iter()
-                .map(|r| {
-                    r.iter()
-                        .map(|(s, _, _)| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                })
+                .map(|r| r.iter().map(String::as_str).collect::<Vec<_>>().join(" | "))
                 .collect::<Vec<_>>()
                 .join("\n")
                 + "\n"
@@ -1011,7 +1006,7 @@ mod tests {
         assert!(text.contains("| 2 | Ada | 9 |"), "{text}");
     }
 
-    /// 一格数字都没有的 csv 也是表：标签列是最左那格
+    /// 一格数字都没有的 csv 也是表，字段仍按原列分开
     #[test]
     fn a_csv_of_words_is_still_a_table() {
         let text = csv_text(b"name,role\nAda,engineer\nGrace,admiral\n", false).unwrap();
@@ -1019,5 +1014,111 @@ mod tests {
             text.starts_with("| name | role |\n| --- | --- |\n| Ada | engineer |"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_missing_email_does_not_attach_the_name_to_the_next_record() {
+        let text = csv_text(b"name,email\nAlice,\nBob,bob@example.com\n", false).unwrap();
+        assert_eq!(
+            text,
+            "| name | email |\n| --- | --- |\n| Alice |  |\n| Bob | bob@example.com |\n"
+        );
+    }
+
+    #[test]
+    fn sparse_delimited_records_keep_their_rows_and_columns() {
+        let csv = "name,email,city\nAlice,,\n,,\n,bob@example.com,\n,,Sydney\nCarol,,Melbourne\nDave,dave@example.com,\nEve,,\n,,\n";
+        let expected = "| name | email | city |\n| --- | --- | --- |\n| Alice |  |  |\n|  | bob@example.com |  |\n|  |  | Sydney |\n| Carol |  | Melbourne |\n| Dave | dave@example.com |  |\n| Eve |  |  |\n";
+        for tsv in [false, true] {
+            let input = if tsv {
+                csv.replace(',', "\t")
+            } else {
+                csv.to_string()
+            };
+            assert_eq!(csv_text(input.as_bytes(), tsv).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn a_single_text_column_keeps_the_header_and_each_record() {
+        for tsv in [false, true] {
+            assert_eq!(
+                csv_text(b"name\nAlice\nBob\n", tsv).unwrap(),
+                "| name |\n| --- |\n| Alice |\n| Bob |\n"
+            );
+        }
+    }
+
+    #[test]
+    fn delimited_fields_keep_their_columns_whether_text_or_numbers() {
+        for (csv, expected) in [
+            (
+                "name,role,team\nAda,engineer,platform\nGrace,admiral,navy\n",
+                "| name | role | team |\n| --- | --- | --- |\n| Ada | engineer | platform |\n| Grace | admiral | navy |\n",
+            ),
+            (
+                "name,role,score\nAda,engineer,9\nGrace,admiral,8\n",
+                "| name | role | score |\n| --- | --- | --- |\n| Ada | engineer | 9 |\n| Grace | admiral | 8 |\n",
+            ),
+        ] {
+            for tsv in [false, true] {
+                let input = if tsv {
+                    csv.replace(',', "\t")
+                } else {
+                    csv.to_string()
+                };
+                assert_eq!(csv_text(input.as_bytes(), tsv).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_delimited_header_can_have_empty_columns_and_records_can_vary_in_width() {
+        let csv = "name,,email\nAlice\nBob,,bob@example.com,extra\n,,eve@example.com\n";
+        let expected = "| name |  | email |  |\n| --- | --- | --- | --- |\n| Alice |  |  |  |\n| Bob |  | bob@example.com | extra |\n|  |  | eve@example.com |  |\n";
+        for tsv in [false, true] {
+            let input = if tsv {
+                csv.replace(',', "\t")
+            } else {
+                csv.to_string()
+            };
+            assert_eq!(csv_text(input.as_bytes(), tsv).unwrap(), expected);
+        }
+        for (csv, expected) in [
+            (
+                "name,\nAlice,alice@example.com\n",
+                "| name |  |\n| --- | --- |\n| Alice | alice@example.com |\n",
+            ),
+            (
+                ",email\n,alice@example.com\n",
+                "|  | email |\n| --- | --- |\n|  | alice@example.com |\n",
+            ),
+        ] {
+            for tsv in [false, true] {
+                let input = if tsv {
+                    csv.replace(',', "\t")
+                } else {
+                    csv.to_string()
+                };
+                assert_eq!(csv_text(input.as_bytes(), tsv).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn symbols_and_quoted_text_stay_in_their_delimited_fields() {
+        let expected = "| kind | symbol | value |\n| --- | --- | --- |\n| price, retail | $ | 10 |\n| rate | % | 20 |\n| pipe \\| and line | hello | 30 |\n";
+        for (input, tsv) in [
+            (
+                "kind,symbol,value\n\"price, retail\",$,10\nrate,%,20\n\"pipe | and\nline\",hello,30\n",
+                false,
+            ),
+            (
+                "kind\tsymbol\tvalue\n\"price, retail\"\t$\t10\nrate\t%\t20\n\"pipe | and\nline\"\thello\t30\n",
+                true,
+            ),
+        ] {
+            assert_eq!(csv_text(input.as_bytes(), tsv).unwrap(), expected);
+        }
     }
 }

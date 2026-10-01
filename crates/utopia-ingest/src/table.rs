@@ -15,9 +15,9 @@
 //!
 //! 只处理最外层且不含内层表的表；套着的表留给 htmd 原路。
 //!
-//! docx、电子表格和 csv 的表不经过 DOM：解析器把格子收成网格交给 [`render_grid`]，之后的
-//! 分类与渲染和 HTML 表一模一样。电子表格和 csv 的第一排（至少两格有字的那排）按惯例是
-//! 列头，哪怕列头是年份这种数字。
+//! docx 和电子表格的表不经过 DOM：解析器把格子收成网格交给 [`render_grid`]，之后的
+//! 分类与渲染和 HTML 表一模一样。电子表格的第一排（至少两格有字的那排）按惯例是
+//! 列头，哪怕列头是年份这种数字。csv/tsv 则保留记录与字段边界，交给 [`render_records`]。
 
 use dom_query::{Document, Selection};
 
@@ -312,6 +312,36 @@ fn escape(text: &str) -> String {
     text.replace('|', "\\|")
 }
 
+/// csv/tsv 的空字段只是缺失值，不能把该记录当成小节，或把独立字段并成财报的标签列。
+pub(crate) fn render_records(rows: &[Vec<String>]) -> Option<String> {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|s| clean(s)).collect())
+        .collect();
+    let header = rows.first()?;
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if width == 0 {
+        return None;
+    }
+    let render = |row: &[String]| {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|s| escape(s))
+            .chain(std::iter::repeat(String::new()))
+            .take(width)
+            .collect();
+        format!("| {} |", cells.join(" | "))
+    };
+    let mut lines = vec![render(header), format!("|{}", " --- |".repeat(width))];
+    lines.extend(
+        rows.iter()
+            .skip(1)
+            .filter(|r| r.iter().any(|s| !s.is_empty()))
+            .map(|r| render(r)),
+    );
+    Some(lines.join("\n"))
+}
+
 /// 缩进深度：先看标签格前面有几根空列（Workiva 报表用空格子缩进），再看左内边距
 /// （另一些用 padding-left）。两者合成一个数，列在前、内边距在后
 fn depth_of(cell: &Cell) -> u32 {
@@ -325,7 +355,7 @@ fn render_table(tbl: &Selection<'_>, inherited: &[String]) -> Option<(String, Ve
 }
 
 /// 别的解析器用的入口：一行是若干 (文字, 跨几列, 左内边距 pt)。`first_is_header` 为真时，
-/// 第一排至少两格有字的行按列头算（电子表格、csv 的惯例），其余行照常分类。
+/// 第一排至少两格有字的行按列头算（电子表格的惯例），其余行照常分类。
 pub(crate) fn render_grid(
     rows: &[Vec<(String, usize, u32)>],
     first_is_header: bool,
