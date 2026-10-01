@@ -372,6 +372,13 @@ pub(crate) fn docx_xml_to_text(
                     Some(c) => c.0.push(' '),
                     None => out.push(' '),
                 },
+                // Word 的不断行连字符（Ctrl+Shift+-）不是 w:t 里的字，是一个元素：页面上照样画出
+                // 连字符，只是不在这里折行。丢了它，2024‑01‑15 读成 20240115，010‑62345678 读成
+                // 01062345678。写成普通连字符，日期和号码才认得出来
+                "w:noBreakHyphen" => match cell.as_mut() {
+                    Some(c) => c.0.push('-'),
+                    None => out.push('-'),
+                },
                 _ => {}
             },
             Ok(Event::End(e)) => match e.name().as_ref() {
@@ -749,6 +756,7 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
                         let text = match c {
                             Data::Empty => String::new(),
                             Data::DateTime(d) => excel_date(d),
+                            Data::Float(f) => excel_number(*f),
                             other => other.to_string(),
                         };
                         (text, 1, 0)
@@ -815,6 +823,22 @@ fn excel_date(d: &calamine::ExcelDateTime) -> String {
     } else {
         format!("{date} {time}")
     }
+}
+
+/// 数字格按 Excel 认的精度写：15 位有效数字。
+///
+/// Excel 比较、显示一个数都只看 15 位有效数字，公式的缓存值却按双精度的 17 位写进文件：
+/// `=0.1+0.2` 存成 0.30000000000000004，`=1.1*1.1-1` 存成 0.21000000000000019，Excel 里
+/// 看到的是 0.3 和 0.21。原样写出来，正文、引文和抽出来的值都带着这截二进制的尾巴。先舍到
+/// 15 位有效数字，再写最短的十进制；本来就干净的数（19.9、1200、45306）一个字不变
+fn excel_number(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    format!("{value:.14e}")
+        .parse::<f64>()
+        .unwrap_or(value)
+        .to_string()
 }
 
 /// Decode before conversion so legacy HTML encodings remain supported.
