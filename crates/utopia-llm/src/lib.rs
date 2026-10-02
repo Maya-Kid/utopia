@@ -362,6 +362,35 @@ impl Reply {
     }
 }
 
+#[derive(Default)]
+struct SseBuffer {
+    bytes: Vec<u8>,
+    after_cr: bool,
+}
+
+impl SseBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        // SSE accepts LF, CRLF and bare CR. Remember CR across HTTP chunks so its
+        // following LF cannot turn one line ending into a spurious empty line.
+        // Keep UTF-8 as bytes until a whole frame has arrived.
+        for &byte in chunk {
+            if self.after_cr && byte == b'\n' {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = byte == b'\r';
+            self.bytes.push(if self.after_cr { b'\n' } else { byte });
+        }
+    }
+
+    fn next_frame(&mut self) -> Option<String> {
+        let end = self.bytes.windows(2).position(|w| w == b"\n\n")?;
+        let frame = String::from_utf8_lossy(&self.bytes[..end]).into_owned();
+        self.bytes.drain(..end + 2);
+        Some(frame)
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
@@ -624,18 +653,16 @@ impl LlmClient {
             return Err(failure("LLM", status, retry_after, &parsed, &raw));
         };
         let mut bytes = resp.bytes_stream();
-        let (mut buf, mut answer) = (Vec::new(), String::new());
+        let (mut buf, mut answer) = (SseBuffer::default(), String::new());
         let (mut saw_frame, mut ended) = (false, false);
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
         while let Some(part) = bytes.next().await {
             let part = part.map_err(Unreachable)?;
             // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
-            buf.extend_from_slice(&part);
+            buf.push(&part);
             // SSE 帧以空行分隔；最后一个不完整的帧留在 buf 里等下一片
-            while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-                let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
-                buf.drain(..pos + 2);
+            while let Some(frame) = buf.next_frame() {
                 self.take_frame(
                     &frame,
                     &mut answer,
@@ -647,7 +674,7 @@ impl LlmClient {
             }
         }
         // **收尾那一帧也算**：末尾不跟空行的实现有的是，丢掉它就是丢掉答案的尾巴
-        let rest = String::from_utf8_lossy(&buf);
+        let rest = String::from_utf8_lossy(&buf.bytes);
         if !rest.trim().is_empty() {
             self.take_frame(
                 &rest,
@@ -860,7 +887,7 @@ impl LlmClient {
 
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
-            let mut buf = Vec::new();
+            let mut buf = SseBuffer::default();
             let mut content = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut finish_reason = None;
@@ -868,10 +895,8 @@ impl LlmClient {
             'outer: while let Some(part) = bytes.next().await {
                 let part = part?;
                 // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
-                buf.extend_from_slice(&part);
-                while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-                    let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
-                    buf.drain(..pos + 2);
+                buf.push(&part);
+                while let Some(frame) = buf.next_frame() {
                     for line in frame.lines() {
                         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                             continue;
@@ -964,17 +989,15 @@ impl LlmClient {
 
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
-            let mut buf = Vec::new();
+            let mut buf = SseBuffer::default();
             let mut ended = false;
             let mut got = 0;
             while let Some(part) = bytes.next().await {
                 let part = part?;
                 // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
-                buf.extend_from_slice(&part);
+                buf.push(&part);
                 // SSE 帧以空行分隔；逐帧取出已完整到达的部分
-                while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-                    let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
-                    buf.drain(..pos + 2);
+                while let Some(frame) = buf.next_frame() {
                     for line in frame.lines() {
                         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                             continue;
@@ -1662,52 +1685,186 @@ mod tests {
 
     fn unicode_sse() -> String {
         format!(
-            "data: {}\n\ndata: [DONE]\n\n",
+            ": keep-alive\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
             json!({
                 "choices": [{"delta": {"content": "你好🦀", "tool_calls": [{
                     "index": 0, "id": "call_1", "function": {
                         "name": "search", "arguments": "{\"city\":\"杭州\"}"
                     }
                 }]}}]
-            })
+            }),
+            json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}}),
         )
     }
 
-    #[tokio::test]
-    async fn bytewise_utf8_survives_collected_streaming() {
-        let (addr, server) = bytewise_sse(&unicode_sse()).await;
-        // 这一刀之后整段回复带着 finish_reason 一起回来，正文在 `text` 上
-        let answer = client_at(addr).chat_at_streaming(&[], None).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(answer.text, "你好🦀");
+    fn sse_with_line_endings(body: &str, endings: &[&str]) -> String {
+        body.split_inclusive('\n')
+            .enumerate()
+            .map(|(i, line)| match line.strip_suffix('\n') {
+                Some(line) => format!("{line}{}", endings[i % endings.len()]),
+                None => line.to_string(),
+            })
+            .collect()
+    }
+
+    const SSE_LINE_ENDINGS: &[&[&str]] = &[&["\n"], &["\r\n"], &["\r"], &["\r\n", "\n", "\r"]];
+
+    #[test]
+    fn sse_line_endings_preserve_frames_at_every_chunk_boundary() {
+        for endings in SSE_LINE_ENDINGS {
+            let body = sse_with_line_endings(": 心跳\ndata: first\n\ndata: second\n\n", endings);
+            for split in 0..=body.len() {
+                let mut buffer = SseBuffer::default();
+                let mut frames = Vec::new();
+                for chunk in [&body.as_bytes()[..split], &body.as_bytes()[split..]] {
+                    buffer.push(chunk);
+                    while let Some(frame) = buffer.next_frame() {
+                        frames.push(frame);
+                    }
+                }
+                assert_eq!(
+                    frames,
+                    [": 心跳\ndata: first", "data: second"],
+                    "line endings {endings:?}, split at byte {split}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
-    async fn bytewise_utf8_survives_raw_streaming() {
-        use futures_util::TryStreamExt;
-        let (addr, server) = bytewise_sse(&unicode_sse()).await;
-        let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
-        let answer: Vec<String> = stream.try_collect().await.unwrap();
-        server.await.unwrap();
-        assert_eq!(answer.concat(), "你好🦀");
+    async fn bytewise_utf8_and_sse_line_endings_survive_collected_streaming() {
+        for endings in SSE_LINE_ENDINGS {
+            let (addr, server) =
+                bytewise_sse(&sse_with_line_endings(&unicode_sse(), endings)).await;
+            let answer = client_at(addr)
+                .chat_at_streaming(&[], None)
+                .await
+                .unwrap_or_else(|error| panic!("line endings {endings:?}: {error}"));
+            server.await.unwrap();
+            assert_eq!(answer.text, "你好🦀", "{endings:?}");
+            assert_eq!(answer.finish_reason.as_deref(), Some("tool_calls"));
+            assert_eq!(
+                answer.usage,
+                Some(Usage {
+                    prompt_tokens: 7,
+                    completion_tokens: 3
+                })
+            );
+        }
     }
 
     #[tokio::test]
-    async fn bytewise_utf8_survives_tool_streaming() {
+    async fn bytewise_utf8_and_sse_line_endings_survive_raw_streaming() {
         use futures_util::TryStreamExt;
-        let (addr, server) = bytewise_sse(&unicode_sse()).await;
-        let stream = client_at(addr)
-            .chat_tools_stream_with(&[], None, None)
-            .await
-            .unwrap();
-        let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
-        server.await.unwrap();
-        let [ToolStreamItem::Delta(delta), ToolStreamItem::Turn(turn)] = items.as_slice() else {
-            panic!("expected a delta and completed turn: {items:?}");
-        };
-        assert_eq!(delta, "你好🦀");
-        assert_eq!(turn.content.as_deref(), Some("你好🦀"));
-        assert_eq!(turn.tool_calls.len(), 1);
+        for endings in SSE_LINE_ENDINGS {
+            let (addr, server) =
+                bytewise_sse(&sse_with_line_endings(&unicode_sse(), endings)).await;
+            let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
+            let answer: Vec<String> = stream
+                .try_collect()
+                .await
+                .unwrap_or_else(|error| panic!("line endings {endings:?}: {error}"));
+            server.await.unwrap();
+            assert_eq!(answer.concat(), "你好🦀", "{endings:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bytewise_utf8_and_sse_line_endings_survive_tool_streaming() {
+        use futures_util::TryStreamExt;
+        for endings in SSE_LINE_ENDINGS {
+            let (addr, server) =
+                bytewise_sse(&sse_with_line_endings(&unicode_sse(), endings)).await;
+            let stream = client_at(addr)
+                .chat_tools_stream_with(&[], None, None)
+                .await
+                .unwrap();
+            let items: Vec<ToolStreamItem> = stream
+                .try_collect()
+                .await
+                .unwrap_or_else(|error| panic!("line endings {endings:?}: {error}"));
+            server.await.unwrap();
+            let [ToolStreamItem::Delta(delta), ToolStreamItem::Turn(turn)] = items.as_slice()
+            else {
+                panic!("expected a delta and completed turn: {items:?}");
+            };
+            assert_eq!(delta, "你好🦀", "{endings:?}");
+            assert_eq!(turn.content.as_deref(), Some("你好🦀"));
+            assert_eq!(turn.finish_reason.as_deref(), Some("tool_calls"));
+            let [call] = turn.tool_calls.as_slice() else {
+                panic!("expected one tool call: {:?}", turn.tool_calls);
+            };
+            assert_eq!(call.id, "call_1");
+            assert_eq!(call.name, "search");
+            assert_eq!(call.arguments, r#"{"city":"杭州"}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_and_tool_streams_deliver_deltas_before_eof_with_cr_line_endings() {
+        use futures_util::TryStreamExt;
+        for ending in ["\r\n", "\r"] {
+            for reader in ["raw", "tools"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (release, wait) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_request(&mut socket).await;
+                    let delta = format!(
+                        "data: {}{ending}{ending}",
+                        json!({"choices": [{"delta": {"content": "hello"}}]})
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{delta}\r\n",
+                        delta.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    // The peer cannot close until the client observes the delta.
+                    let _ = wait.await;
+                    let done = format!("data: [DONE]{ending}{ending}");
+                    let tail = format!("{:x}\r\n{done}\r\n0\r\n\r\n", done.len());
+                    socket.write_all(tail.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+                let client = client_at(addr);
+                match reader {
+                    "raw" => {
+                        let stream = client.chat_stream_raw(&[]).await.unwrap();
+                        futures_util::pin_mut!(stream);
+                        let first = tokio::time::timeout(Duration::from_secs(2), stream.try_next())
+                            .await
+                            .expect("raw delta must arrive before EOF")
+                            .unwrap();
+                        assert_eq!(first.as_deref(), Some("hello"));
+                        release.send(()).unwrap();
+                        assert!(stream.try_next().await.unwrap().is_none());
+                    }
+                    _ => {
+                        let stream = client
+                            .chat_tools_stream_with(&[], None, None)
+                            .await
+                            .unwrap();
+                        futures_util::pin_mut!(stream);
+                        let first = tokio::time::timeout(Duration::from_secs(2), stream.try_next())
+                            .await
+                            .expect("tool delta must arrive before EOF")
+                            .unwrap();
+                        assert!(
+                            matches!(first, Some(ToolStreamItem::Delta(text)) if text == "hello")
+                        );
+                        release.send(()).unwrap();
+                        assert!(matches!(
+                            stream.try_next().await.unwrap(),
+                            Some(ToolStreamItem::Turn(_))
+                        ));
+                        assert!(stream.try_next().await.unwrap().is_none());
+                    }
+                }
+                server.await.unwrap();
+            }
+        }
     }
 
     async fn an_http_error(body: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1752,32 +1909,35 @@ mod tests {
             "data: {}\n\n",
             json!({ "choices": [{"delta": {"content": "你好🦀"}}] })
         );
-        for reader in ["collected", "raw", "tools"] {
-            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
-            let client = client_at(addr);
-            let error = match reader {
-                "collected" => client.chat_at_streaming(&[], None).await.unwrap_err(),
-                "raw" => client
-                    .chat_stream_raw(&[])
-                    .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap_err(),
-                _ => client
-                    .chat_tools_stream_with(&[], None, None)
-                    .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap_err(),
-            };
-            server.await.unwrap();
-            assert_eq!(
-                error.downcast_ref::<Interrupted>().unwrap().got,
-                3,
-                "{reader}"
-            );
+        for endings in SSE_LINE_ENDINGS {
+            let sse = sse_with_line_endings(&sse, endings);
+            for reader in ["collected", "raw", "tools"] {
+                let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+                let client = client_at(addr);
+                let error = match reader {
+                    "collected" => client.chat_at_streaming(&[], None).await.unwrap_err(),
+                    "raw" => client
+                        .chat_stream_raw(&[])
+                        .await
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap_err(),
+                    _ => client
+                        .chat_tools_stream_with(&[], None, None)
+                        .await
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap_err(),
+                };
+                server.await.unwrap();
+                assert_eq!(
+                    error.downcast_ref::<Interrupted>().unwrap().got,
+                    3,
+                    "{reader}, line endings {endings:?}"
+                );
+            }
         }
     }
 
