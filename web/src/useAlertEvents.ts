@@ -9,9 +9,26 @@ export function useAlertEvents() {
   const queryClient = useQueryClient();
   useEffect(() => {
     const es = new EventSource("/api/v1/alerts/events");
-    es.addEventListener("alert", () => {
-      queryClient.invalidateQueries({ queryKey: ["alerts"] });
-    });
-    return () => es.close();
+    let disconnected = false;
+    let disposed = false;
+    const refresh = () => {
+      if (!disposed) queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    };
+    const listeners: Record<string, () => void> = {
+      alert: refresh,
+      error: () => { if (!disposed) disconnected = true; },
+      open: () => {
+        if (disposed || !disconnected) return;
+        disconnected = false;
+        // 断线期间的告警不会回放：恢复时同时补刷角标与列表。
+        refresh();
+      },
+    };
+    for (const [type, listener] of Object.entries(listeners)) es.addEventListener(type, listener);
+    return () => {
+      disposed = true;
+      for (const [type, listener] of Object.entries(listeners)) es.removeEventListener(type, listener);
+      es.close();
+    };
   }, [queryClient]);
 }

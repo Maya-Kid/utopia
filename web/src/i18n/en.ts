@@ -281,6 +281,10 @@ export const en = {
     noMatch: "Nothing matches",
     andMore: (n: number) => `and ${n} more`,
     system: "System",
+    partialRows: (sheet: string, read: number, total: number) =>
+      `${sheet}: read ${read} of ${total} rows`,
+    partialRecords: (read: number, total: number) =>
+      `read ${read} of ${total} records`,
     // kind → 一句说清出了什么事。第二句说该做什么——这才是告警比日志多出来的东西。
     // **一条告警就是一次故障**，所以标题里没有数量
     kinds: {
@@ -311,6 +315,10 @@ export const en = {
       "document.needs_reader": {
         title: "A file needs a model to be read",
         hint: "Scans and images need a document-reading service, and recordings need a transcription model that labels speakers. Each line says what was missing. The file is kept and nothing was read from it yet; it is read as soon as the reader is saved under Administration → Models.",
+      },
+      "document.contents_truncated": {
+        title: "A file was only partly read",
+        hint: "A parser safety cap was reached. The line says which sheet or record range was left out; search and answers do not contain the omitted part.",
       },
       "governance.tripped": {
         title: "The agent stopped deciding on its own",

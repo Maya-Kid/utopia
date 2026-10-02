@@ -251,6 +251,10 @@ export const zh: Strings = {
     noMatch: "没有匹配的",
     andMore: (n: number) => `还有 ${n} 条`,
     system: "系统",
+    partialRows: (sheet: string, read: number, total: number) =>
+      `${sheet}：只读了 ${read}/${total} 行`,
+    partialRecords: (read: number, total: number) =>
+      `只读了 ${read}/${total} 条记录`,
     kinds: {
       "source.sync_failed": {
         title: "来源同步失败",
@@ -267,6 +271,10 @@ export const zh: Strings = {
       "document.needs_reader": {
         title: "有文件要靠模型才读得出来",
         hint: "扫描件和图片要配文档识别服务，录音要配能分出说话人的转写模型；每一行写着缺的是什么。文件已经留着，还没读出任何内容；到「管理 > 模型」存好读取模型，就会自动读。",
+      },
+      "document.contents_truncated": {
+        title: "文件只读了一部分",
+        hint: "解析器到了安全上限。提示行会写明漏掉的是哪个工作表或记录范围；检索和回答不包含被省略的部分。",
       },
       "governance.tripped": {
         title: "agent 停止自动裁决了",

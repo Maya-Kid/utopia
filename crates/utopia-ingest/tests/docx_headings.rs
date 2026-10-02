@@ -74,11 +74,11 @@ fn reports() -> String {
 fn a_paragraph_with_an_outline_level_is_a_heading() {
     let text = read(&reports(), Some(STYLES));
     assert!(
-        text.contains("# 第一周周报（2024-03-01）\n上周销售额增长 5%。\n"),
+        text.contains("# 第一周周报（2024-03-01）\n\n上周销售额增长 5%。\n"),
         "{text}"
     );
     assert!(
-        text.contains("# 第二周周报 （2024-03-08）\n## 明细\n上周退货 3 单。\n"),
+        text.contains("# 第二周周报 （2024-03-08）\n\n## 明细\n\n上周退货 3 单。\n"),
         "{text}"
     );
     assert!(text.contains("# 附录\n"), "{text}");

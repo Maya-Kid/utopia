@@ -360,8 +360,58 @@ pub(crate) fn render_grid(
     rows: &[Vec<(String, usize, u32)>],
     first_is_header: bool,
 ) -> Option<String> {
-    let rows: Vec<Row> = rows
-        .iter()
+    let rows = grid_rows(rows);
+    let forced = first_is_header
+        .then(|| {
+            rows.iter()
+                .position(|r| r.cells.iter().filter(|c| !c.text.is_empty()).count() >= 2)
+        })
+        .flatten()
+        .map(|row| row..row + 1);
+    render_rows(rows, &[], forced).map(|(md, _)| md)
+}
+
+/// docx 和 pptx 用的入口：[`render_grid`] 不认作表的网格也不能丢字。没有列头也没有数据行的
+/// 网格（单列的文字、每排只有一格有字、一格跨整排的告示）按行写出来：一排一段，有字的格用
+/// ` | ` 连起来。HTML 的表有 htmd 接着，电子表格和 csv 各有退路，所以这一步不放在渲染器里。
+pub(crate) fn grid_or_lines(
+    rows: &[Vec<(String, usize, u32)>],
+    first_is_header: bool,
+) -> Option<String> {
+    render_grid(rows, first_is_header).or_else(|| {
+        let lines: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|(text, _, _)| clean(text))
+                    .filter(|text| !text.is_empty())
+                    .collect();
+                (!cells.is_empty()).then(|| cells.join(" | "))
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n\n"))
+    })
+}
+
+/// 电子表格的 merged cells 可以给出不止一行的表头。调用方已经把行投影成网格，
+/// 这里只负责把明确的表头区间按表头处理。
+pub(crate) fn render_grid_with_headers(
+    rows: &[Vec<(String, usize, u32)>],
+    headers: Option<std::ops::Range<usize>>,
+) -> Option<String> {
+    let rows = grid_rows(rows);
+    let forced = headers
+        .map(|mut range| {
+            range.end = range.end.min(rows.len());
+            range
+        })
+        .filter(|range| !range.is_empty());
+    render_rows(rows, &[], forced).map(|(md, _)| md)
+}
+
+fn grid_rows(rows: &[Vec<(String, usize, u32)>]) -> Vec<Row> {
+    rows.iter()
         .map(|cells| {
             let mut col = 0usize;
             let mut out = Vec::with_capacity(cells.len());
@@ -380,20 +430,13 @@ pub(crate) fn render_grid(
                 width: col,
             }
         })
-        .collect();
-    let forced = first_is_header
-        .then(|| {
-            rows.iter()
-                .position(|r| r.cells.iter().filter(|c| !c.text.is_empty()).count() >= 2)
-        })
-        .flatten();
-    render_rows(rows, &[], forced).map(|(md, _)| md)
+        .collect()
 }
 
 fn render_rows(
     mut rows: Vec<Row>,
     inherited: &[String],
-    forced_header: Option<usize>,
+    forced_header: Option<std::ops::Range<usize>>,
 ) -> Option<(String, Vec<String>)> {
     let width = rows.iter().map(|r| r.width).max().unwrap_or(0);
     if width == 0 {
@@ -412,12 +455,12 @@ fn render_rows(
     let (mut headers_seen, mut data_seen) = (false, false);
     for (i, row) in rows.iter_mut().enumerate() {
         let filled = row.cells.iter().filter(|c| !c.text.is_empty()).count();
-        let k = match forced_header {
-            Some(h) if i == h => Kind::Header,
+        let k = match forced_header.as_ref() {
+            Some(header) if header.contains(&i) => Kind::Header,
             // 列头之后的行是记录，哪怕一格数字都没有；只填了一个数字的行（序号列）也是记录，
             // 只填了一个词的行才按小节算
-            Some(h)
-                if i > h
+            Some(header)
+                if i >= header.end
                     && (filled >= 2
                         || row
                             .cells
@@ -640,6 +683,57 @@ mod tests {
     fn render(html: &str) -> String {
         let (_, tables) = lift_tables(html);
         tables.join("\n=====\n")
+    }
+
+    #[test]
+    fn a_grid_that_is_not_a_table_keeps_its_words_as_lines() {
+        let cell = |text: &str, span: usize| (text.to_string(), span, 0);
+        // 单列的文字，中间夹一排空行
+        let one_column = vec![
+            vec![cell("Action", 1)],
+            vec![cell("", 1)],
+            vec![cell("Approve contract", 1)],
+            vec![cell("Renew license", 1)],
+        ];
+        for first_is_header in [false, true] {
+            assert_eq!(render_grid(&one_column, first_is_header), None);
+            assert_eq!(
+                grid_or_lines(&one_column, first_is_header).as_deref(),
+                Some("Action\n\nApprove contract\n\nRenew license")
+            );
+        }
+        // 两列，只有左边一列有字；一格跨整排的告示
+        let left_only = vec![
+            vec![cell("Action", 1), cell("", 1)],
+            vec![cell("Approve  contract", 1), cell("", 1)],
+        ];
+        assert_eq!(
+            grid_or_lines(&left_only, false).as_deref(),
+            Some("Action\n\nApprove contract")
+        );
+        assert_eq!(
+            grid_or_lines(&[vec![cell("Notice for the board", 2)]], false).as_deref(),
+            Some("Notice for the board")
+        );
+        // 一个字都没有的网格什么都不写；真正的表照旧是表
+        assert_eq!(grid_or_lines(&[vec![cell("", 1)]], false), None);
+        let table = vec![
+            vec![cell("Item", 1), cell("2025", 1)],
+            vec![cell("Revenue", 1), cell("10", 1)],
+        ];
+        assert_eq!(grid_or_lines(&table, true), render_grid(&table, true));
+        assert!(grid_or_lines(&table, true)
+            .unwrap()
+            .starts_with("| Item | 2025 |"));
+    }
+
+    /// 单列的 HTML 表多半是排版用的：留给 htmd，格子里的标题、列表和链接才留得住
+    #[test]
+    fn a_single_column_html_table_is_left_to_the_page_converter() {
+        let html = "<table><tr><td><h2>To our shareholders</h2><p>Revenue grew.</p></td></tr><tr><td><p>We opened three offices.</p></td></tr></table>";
+        let (out, tables) = lift_tables(html);
+        assert!(tables.is_empty(), "{tables:?}");
+        assert_eq!(out, html);
     }
 
     #[test]

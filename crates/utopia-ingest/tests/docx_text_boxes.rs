@@ -62,7 +62,7 @@ fn a_text_box_is_read_once() {
             "{text}"
         );
         assert!(text.contains("Before the box."), "{text}");
-        assert!(text.contains("After the box.\nNext paragraph."), "{text}");
+        assert!(text.contains("After the box.\n\nNext paragraph."), "{text}");
     }
 }
 
