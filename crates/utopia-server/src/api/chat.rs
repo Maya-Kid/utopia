@@ -904,8 +904,12 @@ pub async fn chat(
             .filter(|(i, _)| Some(*i) != current)
             .map(|(_, turn)| turn.clone())
             .collect();
-        let context = super::chat_context::Context::new(
-            prior.clone(), history.last_tool_exchange.clone(), client.history_char_budget(),
+        let prior_reasoning: Vec<_> = history.reasoning.iter().enumerate()
+            .filter(|(i, _)| Some(*i) != current)
+            .map(|(_, text)| text.clone()).collect();
+        let context = super::chat_context::Context::with_reasoning(
+            prior.clone(), history.last_tool_exchange.clone(),
+            prior_reasoning.clone(), client.history_char_budget(),
         );
         let rig_agent = AgentBuilder::new(RigModel::with_context(client.clone(), context.clone()))
             .preamble(&system_prompt)
@@ -916,7 +920,9 @@ pub async fn chat(
             .build();
         let mut runner = rig_agent
             .runner(Message::user(query.clone()))
-            .history(agent::history_messages(&prior, &history.last_tool_exchange));
+            .history(agent::history_messages_with_reasoning(
+                &prior, &history.last_tool_exchange, &prior_reasoning,
+            ));
         // 贴在历史之后、当前问题之前——位置就是服从性，跟抽取里 known_block
         // 紧挨正文是同一条理由（角色与位置由 `rig_model::wire` 定）
         if let Some(block) = agent::known_entities_block(&history.entities, KNOWN_ENTITY_LIMIT) {
@@ -935,6 +941,7 @@ pub async fn chat(
         let mut exchange_acc: Vec<serde_json::Value> = Vec::new();
         // 当前模型回合里说的话与发出的调用；回合的结果一到，攒成一条 assistant 消息
         let mut turn_text = String::new();
+        let mut turn_reasoning: Option<String> = None;
         let mut turn_calls: Vec<serde_json::Value> = Vec::new();
         // 这一回合的正文发出去了多少；后面的扣着，因为那可能是写成正文的工具调用（#937）
         let mut turn_published = 0usize;
@@ -945,6 +952,15 @@ pub async fn chat(
 
         while let Some(item) = run.next().await {
             match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning {
+                    reasoning, ..
+                })) => {
+                    for block in reasoning.content {
+                        if let rig_core::message::ReasoningContent::Text { text, .. } = block {
+                            turn_reasoning.get_or_insert_default().push_str(&text);
+                        }
+                    }
+                }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
                     // Tool-round narration stays live, line by line; a line that is or
                     // may become a tool call written as text is held (#937). Withhold the
@@ -1000,7 +1016,7 @@ pub async fn chat(
                             answer_acc.push_str("\n\n");
                             yield ProducerEvent::Progress(delta_event("\n\n"));
                         }
-                        exchange_acc.push(json!({
+                        let mut recorded = json!({
                             "role": "assistant",
                             "content": if turn_text.is_empty() {
                                 serde_json::Value::Null
@@ -1008,7 +1024,11 @@ pub async fn chat(
                                 serde_json::Value::String(turn_text.clone())
                             },
                             "tool_calls": std::mem::take(&mut turn_calls),
-                        }));
+                        });
+                        if let Some(reasoning) = turn_reasoning.take() {
+                            recorded["reasoning_content"] = json!(reasoning);
+                        }
+                        exchange_acc.push(recorded);
                         turn_text.clear();
                         turn_published = 0;
                         turn_holding = false;
@@ -1078,6 +1098,7 @@ pub async fn chat(
                         yield ProducerEvent::Progress(delta_event("\n\n"));
                     }
                     turn_text.clear();
+                    turn_reasoning = None;
                     turn_calls.clear();
                     turn_published = 0;
                     turn_holding = false;
@@ -1128,7 +1149,12 @@ pub async fn chat(
                 exchange: &exchange_acc, sources: &sources, resolved: &resolved,
             };
             match finalization::answer_with_context(&client, input, &context).await {
-                Ok(answer) => { turn_text = answer; turn_calls.clear(); finished = true; }
+                Ok(answer) => {
+                    turn_text = answer.content.unwrap_or_default();
+                    turn_reasoning = answer.reasoning_content;
+                    turn_calls.clear();
+                    finished = true;
+                }
                 Err(e) => {
                     let message = format!("Model could not produce a final answer: {e}");
                     let code = model_failure_code(&e)
@@ -1184,6 +1210,7 @@ pub async fn chat(
                 .unwrap_or_default();
             sources = carried_sources(&answer_acc, previous, &history.last_sources);
         }
+        exchange_acc.extend(terminal_reasoning(turn_reasoning));
         yield ProducerEvent::Outcome(Ok(Answer {
             content: answer_acc,
             record: utopia_store::conversations::TurnRecord {
@@ -1237,6 +1264,15 @@ fn describe(err: &StreamingError) -> (Failure, bool) {
     }
 }
 
+// DeepSeek also needs a completed answer's reasoning on later tool requests.
+// Keep it in the internal exchange metadata, apart from the published answer.
+fn terminal_reasoning(reasoning: Option<String>) -> Vec<serde_json::Value> {
+    reasoning
+        .into_iter()
+        .map(|text| json!({"role":"assistant", "reasoning_content":text}))
+        .collect()
+}
+
 /// 降级路径：端点不支持工具调用时的一次性 RAG 注入。
 /// 检索一次、把来源塞进系统提示、流式作答、落库
 fn legacy_rag(
@@ -1267,6 +1303,7 @@ fn legacy_rag(
             serde_json::to_string(&legacy_sources).unwrap_or_else(|_| "[]".into()),
         ));
         let mut answer_acc = String::new();
+        let mut reasoning = None;
         let deltas = loop {
             let (turns, _) = context.snapshot();
             let mut lmsgs = vec![json!({ "role": "system", "content": legacy_system_prompt(&chunks) })];
@@ -1274,7 +1311,7 @@ fn legacy_rag(
                 lmsgs.push(json!({ "role": role, "content": content }));
             }
             lmsgs.push(json!({"role":"user", "content":query}));
-            match client.chat_stream_raw(&lmsgs).await {
+            match client.chat_tools_stream_with(&lmsgs, None, None).await {
                 Err(e) if context.recover(&client, &e) => continue,
                 result => break result,
             }
@@ -1284,7 +1321,8 @@ fn legacy_rag(
                 let mut deltas = std::pin::pin!(deltas);
                 while let Some(item) = deltas.next().await {
                     match item {
-                        Ok(text) => { answer_acc.push_str(&text); yield ProducerEvent::Progress(delta_event(&text)); }
+                        Ok(utopia_llm::ToolStreamItem::Delta(text)) => { answer_acc.push_str(&text); yield ProducerEvent::Progress(delta_event(&text)); }
+                        Ok(utopia_llm::ToolStreamItem::Turn(turn)) => reasoning = turn.reasoning_content,
                         Err(e) => { yield ProducerEvent::Outcome(Err(Failure::model(&e, e.to_string()))); return; }
                     }
                 }
@@ -1296,6 +1334,7 @@ fn legacy_rag(
                     content: answer_acc,
                     record: utopia_store::conversations::TurnRecord {
                         sources: serde_json::Value::Array(legacy_sources),
+                        tool_exchange: json!(terminal_reasoning(reasoning)),
                         ..utopia_store::conversations::TurnRecord::empty()
                     },
                     final_text: None,
