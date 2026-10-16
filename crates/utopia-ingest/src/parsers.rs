@@ -779,8 +779,12 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<(String, Vec<crate::ParseWarn
     let mut warnings = Vec::new();
     for sheet_name in workbook.sheet_names() {
         let (text, rows_read, rows_total) = match &mut workbook {
-            calamine::Sheets::Xlsx(book) => xlsx_sheet(book, &sheet_name, XLSX_SEGMENT_LIMIT)
-                .with_context(|| format!("Could not read worksheet {sheet_name}"))?,
+            calamine::Sheets::Xlsx(book) => {
+                let Ok(sheet) = xlsx_sheet(book, &sheet_name, XLSX_SEGMENT_LIMIT) else {
+                    continue;
+                };
+                sheet
+            }
             _ => {
                 let Ok(range) = workbook.worksheet_range(&sheet_name) else {
                     continue;
@@ -838,12 +842,7 @@ fn xlsx_sheet(
     let mut start_row = u32::MAX;
     let mut end_row = 0;
     let mut row_counts = vec![0usize; SPREADSHEET_ROW_LIMIT];
-    let mut reader = match book.worksheet_cells_reader(sheet) {
-        Ok(reader) => reader,
-        // Calamine's ordinary worksheet_range also skips chart sheets.
-        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok((String::new(), 0, 0)),
-        Err(error) => return Err(error.into()),
-    };
+    let mut reader = book.worksheet_cells_reader(sheet)?;
     // Keep only the first 2,000 physical rows' counts, even if XML cells arrive
     // out of order. The full row bounds survive so truncation remains honest.
     while let Some(cell) = reader.next_cell()? {
@@ -864,7 +863,9 @@ fn xlsx_sheet(
         end_row = end_row.max(row);
         let offset = (row - start_row) as usize;
         if let Some(count) = row_counts.get_mut(offset) {
-            *count += 1;
+            // Repeated coordinates overwrite values below, so even malformed
+            // XML cannot retain more than one physical row's worth of cells.
+            *count = (*count + 1).min(16_384);
         }
     }
     drop(reader);
@@ -881,10 +882,6 @@ fn xlsx_sheet(
         }
         count += cells;
     }
-    anyhow::ensure!(
-        height > 0,
-        "The first worksheet row exceeds the cell budget"
-    );
     // Counts bound this allocation before any source values are retained. A
     // distant note adds one entry, not thousands of empty Data/String objects.
     let mut values = vec![std::collections::BTreeMap::<u32, String>::new(); height];
@@ -898,7 +895,7 @@ fn xlsx_sheet(
         }
     }
     drop(reader);
-    let merges = book.merge_cells_by_sheet_name(sheet)?;
+    let merges = book.merge_cells_by_sheet_name(sheet).unwrap_or_default();
     loop {
         let start_col = values
             .iter()
@@ -943,10 +940,6 @@ fn xlsx_sheet(
             segments += cells.len();
             rows.push(cells);
         }
-        anyhow::ensure!(
-            !rows.is_empty(),
-            "The first worksheet row exceeds the segment budget"
-        );
         if rows.len() != height {
             height = rows.len();
             values.truncate(height);
@@ -1398,7 +1391,10 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
-    fn budget_book() -> calamine::Xlsx<Cursor<Vec<u8>>> {
+    fn budget_book(sheet_data: &str, merges: &str) -> calamine::Xlsx<Cursor<Vec<u8>>> {
+        let worksheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{sheet_data}</sheetData>{merges}</worksheet>"#
+        );
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, xml) in [
             (
@@ -1417,10 +1413,7 @@ mod tests {
                 "xl/_rels/workbook.xml.rels",
                 r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
             ),
-            (
-                "xl/worksheets/sheet1.xml",
-                r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>left</t></is></c><c r="C1" t="inlineStr"><is><t>right</t></is></c></row><row r="2"><c r="A2"><v>1</v></c><c r="C2"><v>2</v></c></row></sheetData></worksheet>"#,
-            ),
+            ("xl/worksheets/sheet1.xml", &worksheet),
         ] {
             zip.start_file(name, zip::write::SimpleFileOptions::default())
                 .unwrap();
@@ -1432,16 +1425,28 @@ mod tests {
     #[test]
     fn a_segment_budget_keeps_only_complete_rows() {
         // Four source cells fit; two rows of three emitted segments do not.
-        let (_, rows_read, rows_total) = xlsx_sheet(&mut budget_book(), "Budget", 5).unwrap();
+        let rows = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>left</t></is></c><c r="C1" t="inlineStr"><is><t>right</t></is></c></row><row r="2"><c r="A2"><v>1</v></c><c r="C2"><v>2</v></c></row>"#;
+        let (_, rows_read, rows_total) =
+            xlsx_sheet(&mut budget_book(rows, ""), "Budget", 5).unwrap();
         assert_eq!((rows_read, rows_total), (1, 2));
     }
 
     #[test]
-    fn a_first_row_that_exceeds_the_budget_is_reported() {
-        for budget in [1, 2] {
-            let error = xlsx_sheet(&mut budget_book(), "Budget", budget).unwrap_err();
-            assert!(error.to_string().contains("first worksheet row"));
-        }
+    fn dropping_a_row_reprojects_the_retained_title_and_merged_span() {
+        let title = r#"<row r="1"><c r="B1" t="inlineStr"><is><t>Title</t></is></c></row>"#;
+        let rest = r#"<row r="2"><c r="A2" t="inlineStr"><is><t xml:space="preserve"> </t></is></c><c r="C2" t="inlineStr"><is><t xml:space="preserve"> </t></is></c></row><row r="3"><c r="Z3" t="inlineStr"><is><t>note</t></is></c></row>"#;
+        let merges = r#"<mergeCells count="1"><mergeCell ref="B1:C1"/></mergeCells>"#;
+        // Four source cells fit, but the first two rows use 3 + 4 segments.
+        let (text, rows_read, rows_total) = xlsx_sheet(
+            &mut budget_book(&format!("{title}{rest}"), merges),
+            "Budget",
+            5,
+        )
+        .unwrap();
+        let (expected, _, _) = xlsx_sheet(&mut budget_book(title, merges), "Budget", 5).unwrap();
+        assert_eq!((rows_read, rows_total), (1, 3));
+        assert!(text.contains("Title"));
+        assert_eq!(text, expected);
     }
 
     #[test]

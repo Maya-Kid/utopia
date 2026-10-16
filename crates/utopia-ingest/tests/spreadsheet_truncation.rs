@@ -26,10 +26,14 @@ fn workbook_xml(sheet_data: &str) -> Vec<u8> {
 }
 
 fn workbook_sheets(sheets: &[(&str, &str)]) -> Vec<u8> {
-    workbook_sheets_with_chart(sheets, false)
+    workbook_sheets_with_chart(sheets, false, "")
 }
 
-fn workbook_sheets_with_chart(sheets: &[(&str, &str)], chart: bool) -> Vec<u8> {
+fn workbook_sheets_with_chart(
+    sheets: &[(&str, &str)],
+    chart: bool,
+    worksheet_suffix: &str,
+) -> Vec<u8> {
     let mut content_types = String::from(
         r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>"#,
     );
@@ -45,7 +49,7 @@ fn workbook_sheets_with_chart(sheets: &[(&str, &str)], chart: bool) -> Vec<u8> {
         )
         .unwrap();
         write!(sheet_rels, r#"<Relationship Id="rId{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{id}.xml"/>"#).unwrap();
-        parts.push((format!("xl/worksheets/sheet{id}.xml"), format!(r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{sheet_data}</sheetData></worksheet>"#)));
+        parts.push((format!("xl/worksheets/sheet{id}.xml"), format!(r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{sheet_data}</sheetData>{worksheet_suffix}</worksheet>"#)));
     }
     if chart {
         let id = sheets.len() + 1;
@@ -225,19 +229,39 @@ fn an_ordinary_dense_sheet_retains_two_thousand_rows_and_one_hundred_fifty_colum
 }
 
 #[test]
-fn a_broken_sheet_is_reported_even_when_another_sheet_is_readable() {
+fn a_broken_sheet_does_not_prevent_reading_the_other_sheets() {
     let good = ledger_rows(1);
+    let expected = utopia_ingest::parse("ledger.xlsx", &workbook_xml(&good)).unwrap();
     let broken = r#"<row r="1"><c r="A1" t="n"><v>not-a-number</v></c></row>"#;
     let bytes = workbook_sheets(&[("Ledger", &good), ("Broken", broken)]);
-    let error = utopia_ingest::parse("ledger.xlsx", &bytes).unwrap_err();
-    assert!(format!("{error:#}").contains("Broken"), "{error:#}");
+    let parsed = utopia_ingest::parse("ledger.xlsx", &bytes).unwrap();
+    assert_eq!(parsed.text, expected.text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+}
+
+#[test]
+fn unreadable_merges_do_not_prevent_reading_the_worksheet_cells() {
+    use calamine::Reader as _;
+
+    let rows = ledger_rows(1);
+    let expected = utopia_ingest::parse("ledger.xlsx", &workbook_xml(&rows)).unwrap();
+    let merges = r#"<mergeCells count="1"><mergeCell ref="not-a-range"/></mergeCells>"#;
+    let bytes = workbook_sheets_with_chart(&[("Ledger", &rows)], false, merges);
+    let mut book: calamine::Xlsx<_> =
+        calamine::open_workbook_from_rs(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(book.worksheet_range("Ledger").unwrap().height(), 2);
+    assert!(book.merge_cells_by_sheet_name("Ledger").is_err());
+
+    let parsed = utopia_ingest::parse("ledger.xlsx", &bytes).unwrap();
+    assert_eq!(parsed.text, expected.text);
+    assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
 }
 
 #[test]
 fn a_chartsheet_does_not_prevent_reading_the_worksheets() {
     let rows = ledger_rows(1);
     let expected = utopia_ingest::parse("ledger.xlsx", &workbook_xml(&rows)).unwrap();
-    let bytes = workbook_sheets_with_chart(&[("Ledger", &rows)], true);
+    let bytes = workbook_sheets_with_chart(&[("Ledger", &rows)], true, "");
     let parsed = utopia_ingest::parse("ledger.xlsx", &bytes).unwrap();
     assert_eq!(parsed.text, expected.text);
     assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
