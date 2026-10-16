@@ -79,6 +79,41 @@ fn a_spreadsheet_at_the_row_cap_has_no_warning() {
 }
 
 #[test]
+fn sparse_sheets_keep_the_budget_boundary_and_report_every_omitted_row() {
+    let parsed = utopia_ingest::parse(
+        "sparse-sheets.xlsx",
+        include_bytes!("fixtures/sparse-sheets.xlsx"),
+    )
+    .unwrap();
+    for sheet in ["tall", "wide"] {
+        assert!(parsed.text.contains(&format!("{sheet}-header")));
+        assert!(parsed.text.contains(&format!("{sheet}-last-read")));
+        assert!(!parsed.text.contains(&format!("{sheet}-omitted")));
+    }
+    let warnings: Vec<_> = parsed
+        .warnings
+        .iter()
+        .map(|warning| {
+            assert_eq!(warning.kind, "spreadsheet.rows_truncated");
+            warning.detail.clone()
+        })
+        .collect();
+    assert_eq!(
+        warnings,
+        vec![
+            serde_json::json!({
+                "sheet": "Tall", "rows_read": 2000,
+                "rows_total": 1000000, "rows_omitted": 998000,
+            }),
+            serde_json::json!({
+                "sheet": "Wide", "rows_read": 200,
+                "rows_total": 201, "rows_omitted": 1,
+            }),
+        ]
+    );
+}
+
+#[test]
 fn a_csv_past_the_record_cap_reports_the_records_it_left_out() {
     let parsed = utopia_ingest::parse("customers.csv", csv(10_000).as_bytes()).unwrap();
 

@@ -7,6 +7,9 @@ use std::io::{Cursor, Read, Write};
 use std::process::Command;
 
 const SPREADSHEET_ROW_LIMIT: usize = 2_000;
+// A distant cell makes an XLSX range dense, including all the empty cells in between.
+// Allow 2,000 rows of 100 columns before allocating the grid; wider sheets read fewer rows.
+const SPREADSHEET_CELL_LIMIT: usize = 200_000;
 const CSV_RECORD_LIMIT: usize = 10_000;
 
 /// 文本解码：chardetng 探测编码（覆盖 GBK/GB18030/BIG5 等中文常见编码）。
@@ -773,7 +776,17 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<(String, Vec<crate::ParseWarn
     let mut out = String::new();
     let mut warnings = Vec::new();
     for sheet_name in workbook.sheet_names() {
-        let Ok(range) = workbook.worksheet_range(&sheet_name) else {
+        let read = match &mut workbook {
+            calamine::Sheets::Xlsx(book) => xlsx_range(book, &sheet_name),
+            _ => workbook
+                .worksheet_range(&sheet_name)
+                .map(|range| {
+                    let rows_total = range.height();
+                    (range, rows_total)
+                })
+                .map_err(anyhow::Error::from),
+        };
+        let Ok((range, rows_total)) = read else {
             continue;
         };
         if range.is_empty() {
@@ -790,9 +803,8 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<(String, Vec<crate::ParseWarn
             _ => Vec::new(),
         };
         out.push_str(&format!("\n# Sheet: {sheet_name}\n\n"));
-        let rows_total = range.height();
-        if rows_total > SPREADSHEET_ROW_LIMIT {
-            let rows_read = SPREADSHEET_ROW_LIMIT;
+        let rows_read = range.height().min(SPREADSHEET_ROW_LIMIT);
+        if rows_total > rows_read {
             warnings.push(crate::ParseWarning {
                 kind: crate::ParseWarning::SPREADSHEET_ROWS_TRUNCATED,
                 detail: serde_json::json!({
@@ -820,6 +832,51 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<(String, Vec<crate::ParseWarn
         }
     }
     Ok((out, warnings))
+}
+
+fn xlsx_range(
+    book: &mut calamine::Xlsx<Cursor<Vec<u8>>>,
+    sheet: &str,
+) -> anyhow::Result<(calamine::Range<calamine::Data>, usize)> {
+    // worksheet_range() materializes the whole rectangle before our 2,000-row cap:
+    // two cells at A1 and P1000000 used to allocate 512 MB for a 1.4 KB file.
+    // Read the actual cells first, without trusting the optional XML dimension hint.
+    let mut start = (u32::MAX, u32::MAX);
+    let mut end = (0, 0);
+    let mut reader = book.worksheet_cells_reader(sheet)?;
+    while let Some(cell) = reader.next_cell()? {
+        if cell.get_value() == &calamine::DataRef::Empty {
+            continue;
+        }
+        let (row, col) = cell.get_position();
+        start = (start.0.min(row), start.1.min(col));
+        end = (end.0.max(row), end.1.max(col));
+    }
+    drop(reader);
+    if start.0 == u32::MAX {
+        return Ok((calamine::Range::empty(), 0));
+    }
+    let rows_total = end.0 as usize - start.0 as usize + 1;
+    let width = end.1 as usize - start.1 as usize + 1;
+    let rows_read = rows_total
+        .min(SPREADSHEET_ROW_LIMIT)
+        .min(SPREADSHEET_CELL_LIMIT / width);
+    anyhow::ensure!(
+        rows_read > 0,
+        "The spreadsheet has too many columns to read"
+    );
+    end.0 = start.0 + rows_read as u32 - 1;
+    let mut range = calamine::Range::new(start, end);
+    // A second pass keeps date/style decoding in Calamine and counts rows beyond
+    // the budget honestly, without retaining every nonempty cell in memory.
+    let mut reader = book.worksheet_cells_reader(sheet)?;
+    while let Some(cell) = reader.next_cell()? {
+        let position = cell.get_position();
+        if position.0 <= end.0 && cell.get_value() != &calamine::DataRef::Empty {
+            range.set_value(position, calamine::Data::from(cell.get_value().clone()));
+        }
+    }
+    Ok((range, rows_total))
 }
 
 #[derive(Clone)]
@@ -1204,6 +1261,20 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_xlsx_ranges_are_bounded_before_the_dense_allocation() {
+        let bytes = include_bytes!("../tests/fixtures/sparse-sheets.xlsx");
+        let mut book = calamine::open_workbook_from_rs(Cursor::new(bytes.to_vec())).unwrap();
+        for (sheet, rows_total, rows_read, width) in
+            [("Tall", 1_000_000, 2_000, 16), ("Wide", 201, 200, 1_000)]
+        {
+            let (range, total) = xlsx_range(&mut book, sheet).unwrap();
+            assert_eq!(total, rows_total);
+            assert_eq!(range.get_size(), (rows_read, width));
+            assert!(range.height() * range.width() <= SPREADSHEET_CELL_LIMIT);
+        }
+    }
 
     const DOC: &str = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
 <w:p><w:r><w:t>Segment results</w:t></w:r></w:p>
