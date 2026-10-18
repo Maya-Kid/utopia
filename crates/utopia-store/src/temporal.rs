@@ -969,33 +969,38 @@ pub async fn state_derived_end<'a>(
 /// 调用方（`insert_fact_on`）只比了时刻，这里锁住那一行再查两件事：精度与这次说的相同——
 /// 日精度写明的 2025-01-01 是那一天，不是 2024 年的尽头；终点不是人改过的
 /// （`corrected_ends` 为空或只有起点）——人把显示的 2024 改成 2025，就是要到 2025 年。
-/// 引擎画的终点、已经标过的、没有起点的不在这里。返回修正行 id；不必标的返回 `None`
+/// 已经标过的不再标。那一行带不带得了标记（引擎画的终点、没有起点的行带不了），读出来交给
+/// `graph::period_mark_fits` 判。返回修正行 id；不必标的返回 `None`
 pub(crate) async fn mark_end_after_period<'a>(
     pool: impl sqlx::Acquire<'a, Database = Postgres>,
     fact_id: Uuid,
     precision: &str,
 ) -> AppResult<Option<Uuid>> {
     let mut tx = pool.begin().await?;
-    let stated: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT valid_to FROM facts
-          WHERE id = $1 AND invalidated_at IS NULL
-            AND valid_from IS NOT NULL AND valid_to IS NOT NULL
-            AND valid_to_precision = $2
-            AND NOT end_derived AND NOT end_after_period
-            AND (corrected_ends IS NULL OR corrected_ends = 'start')
-          FOR UPDATE",
-    )
-    .bind(fact_id)
-    .bind(precision)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let marked = match stated {
+    #[allow(clippy::type_complexity)]
+    let locked_row: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>, bool, bool)> =
+        sqlx::query_as(
+            "SELECT f.valid_from, f.valid_to, f.end_derived,
+                    COALESCE(r.temporal = 'state', false) AS declared_state
+               FROM facts f LEFT JOIN relation_types r ON r.id = f.predicate_id
+              WHERE f.id = $1 AND f.invalidated_at IS NULL
+                AND f.valid_to_precision = $2 AND NOT f.end_after_period
+                AND (f.corrected_ends IS NULL OR f.corrected_ends = 'start')
+              FOR UPDATE OF f",
+        )
+        .bind(fact_id)
+        .bind(precision)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let marked = match locked_row {
         // 起点那一半人改过的照旧是人的：改写的 CASE 把 'start' 原样带过去
-        Some(at) => {
+        Some((from, Some(at), end_derived, declared_state))
+            if crate::graph::period_mark_fits(declared_state, from, Some(at), end_derived) =>
+        {
             let end = End::At(at, precision.to_string());
             rewrite_end_tx(&mut tx, fact_id, &end, false, false, true).await?
         }
-        None => None,
+        _ => None,
     };
     tx.commit().await?;
     Ok(marked)
@@ -1046,9 +1051,15 @@ async fn rewrite_end_tx(
         End::At(at, precision) => (Some(*at), Some(precision.as_str()), None),
         End::Unknown(anchor) => (None, Some(crate::graph::ENDED_UNKNOWN), *anchor),
     };
-    // 标记只落在写明、有日期、有起点的终点上（约束 facts_end_after_period_needs_a_stated_end）：
-    // 时间线画的、不知哪天的、重新打开的，和没有起点的行，一律不带——起点是上面锁住时读的
-    let after_period = after_period && !derived && from.is_some() && matches!(end, End::At(..));
+    // 标记只落在带得了它的终点上（`graph::period_mark_fits`）：时间线画的、不知哪天的、重新
+    // 打开的终点，没有起点或属性不是状态的行，一律不带——起点和谓词是上面锁住时读的。要标时
+    // 才去查属性：不标的改写（时间线重画、关成不知哪天）不多一次查询
+    let after_period = after_period && {
+        let declared_state = predicate.is_some()
+            && crate::graph::predicate_temporal(&mut **tx, predicate).await?
+                == crate::graph::Temporal::State;
+        crate::graph::period_mark_fits(declared_state, from, valid_to, derived)
+    };
     let corrected = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id, object_value,

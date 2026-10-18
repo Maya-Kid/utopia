@@ -342,7 +342,7 @@ pub struct Validity<'a> {
     pub from_grade: Option<&'a str>,
     /// 终点是原文所说时段之后的那一刻（`facts.end_after_period`，#994）：「2024 年离开」关上
     /// 2024-03-01 起的那段，存 2025-01-01，原文说的是 2024。只看值分不出它和「到 2025 年」。
-    /// 写入口归一（`drop_period_mark_unless`），只留在声明成状态、有起点、终点有日期的行上
+    /// 写入口归一（`drop_period_mark_unless`），只留在带得了它的行上（[`period_mark_fits`]）
     pub end_after_period: bool,
 }
 
@@ -532,13 +532,12 @@ impl<'a> Validity<'a> {
         self
     }
 
-    /// 「终点说的是它之前那个时段」只对声明成状态、有起点、终点有日期的行有意义：两个写入口
-    /// （`insert_fact_on`、`correct_interval`）在 [`Validity::under`] 之后各过一遍，其余的
-    /// 标记在这里丢掉。事件归一成一刻、恒常抹掉日期、没有谓词的行不过 `under`，都落在这里。
-    /// 没有起点的行第一刀不标（约束 `facts_end_after_period_needs_a_stated_end` 同一句话）：
-    /// 终点只在起点落在那个时段里时才被挪到时段的尽头
+    /// 「终点说的是它之前那个时段」带不了的行（[`period_mark_fits`]），标记在这里丢掉：两个
+    /// 写入口（`insert_fact_on`、`correct_interval`）在 [`Validity::under`] 之后各过一遍。
+    /// 事件归一成一刻、恒常抹掉日期、没有谓词的行不过 `under`，都落在这里。进写入口的终点是
+    /// 写明的，不是时间线画的
     pub(crate) fn drop_period_mark_unless(mut self, declared_state: bool) -> Self {
-        self.end_after_period &= declared_state && self.from.is_some() && self.to.is_some();
+        self.end_after_period &= period_mark_fits(declared_state, self.from, self.to, false);
         self
     }
 
@@ -549,6 +548,23 @@ impl<'a> Validity<'a> {
     pub fn has_ended(&self) -> bool {
         self.to.is_some() || self.to_precision == Some(ENDED_UNKNOWN)
     }
+}
+
+/// 一个终点带不带得了「说的是它之前那个时段」的标记（`end_after_period`，#994）：属性声明成
+/// 状态、有起点、终点有日期、不是时间线画的。
+///
+/// 与约束 `facts_end_after_period_needs_a_stated_end` 同一句话（属性是不是状态约束看不到，
+/// 由这里查）。Rust 这边判这件事的都调它：写入口的归一（`Validity::drop_period_mark_unless`）、
+/// `temporal::rewrite_end_tx` 落标记前、`temporal::mark_end_after_period` 补标记前、改区间的
+/// 路由。没有起点的行第一刀不标：终点只在起点落在那个时段里时才被挪到时段的尽头。第二刀让
+/// 时间解析自己写这种终点时，起点那一条在这里和约束里一起去掉
+pub fn period_mark_fits(
+    declared_state: bool,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+    end_derived: bool,
+) -> bool {
+    declared_state && from.is_some() && to.is_some() && !end_derived
 }
 
 /// 一段起止同值的状态（#966）：写入、改区间、关上都拒它，说的是同一句话

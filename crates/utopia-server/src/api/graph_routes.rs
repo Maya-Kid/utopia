@@ -326,8 +326,8 @@ fn bad_end_after_period() -> AppError {
     )
 }
 
-/// 复刻 `facts` 表的 CHECK：两端的精度，标记要有起点和带日期的终点（属性是不是状态，读到
-/// 行之后再查）；外加一条数据库没有的：截到各自精度之后，起点不能晚于终点。
+/// 复刻 `facts` 表的 CHECK：两端的精度，标记要两端带得了它（`period_mark_fits`，属性是不是
+/// 状态读到行之后再查）；外加一条数据库没有的：截到各自精度之后，起点不能晚于终点。
 ///
 /// 在这里挡住是为了让错误说人话。交给数据库挡会得到一句约束名，而这三态
 /// （仍在持续 / 结束了不知哪天 / 某日结束）本来就是账本里最容易记混的地方。
@@ -354,8 +354,10 @@ fn check_interval(p: &FactTimePatch) -> Result<(), AppError> {
             ))
         }
     }
-    // 显式要标记：得有起点、终点得有日期（属性是不是状态，读到行之后再看）
-    if p.end_after_period == Some(true) && (p.valid_from.is_none() || p.valid_to.is_none()) {
+    // 显式要标记：两端得带得了它。属性是不是状态要读到行才知道，这里先当它是，只看两端
+    if p.end_after_period == Some(true)
+        && !utopia_store::graph::period_mark_fits(true, p.valid_from, p.valid_to, false)
+    {
         return Err(bad_end_after_period());
     }
     // 比截到各自精度之后的两端：存下的就是截过的。比原值时，小时精度的 08:30 终点与分钟精度
@@ -408,9 +410,6 @@ pub async fn update_fact_time(
     let Some(before) = before else {
         return Err(AppError::NotFound.into());
     };
-    if req.end_after_period == Some(true) && !before.declared_state {
-        return Err(bad_end_after_period().into());
-    }
     // 存下的是截到精度之后的值：比较、判标记都按它
     let truncate = utopia_store::graph::truncate_to;
     let from = req
@@ -419,14 +418,22 @@ pub async fn update_fact_time(
     let to = req
         .valid_to
         .map(|t| truncate(t, req.valid_to_precision.as_deref()));
-    // 不给标记：发回存的终点、还带着起点，就是没动它，留着；清掉起点的丢掉（时刻照旧）
+    // 读到了行，属性是不是状态也知道了：显式要的标记按整条规矩再判一遍
+    if req.end_after_period == Some(true)
+        && !utopia_store::graph::period_mark_fits(before.declared_state, from, to, false)
+    {
+        return Err(bad_end_after_period().into());
+    }
+    // 不给标记：发回存的终点（时刻与精度）、这次的两端还带得了它，就是没动它，留着；清掉起点
+    // 的带不了，丢掉（时刻照旧）。属性这里不再判：存的标记是按当时的属性写下的，原样发回的
+    // 请求不改写这一行
     let end_after_period = match req.end_after_period {
         Some(mark) => mark,
         None => {
             before.end_after_period
-                && from.is_some()
                 && to == before.valid_to
                 && req.valid_to_precision == before.valid_to_precision
+                && utopia_store::graph::period_mark_fits(true, from, to, false)
         }
     };
     // 一字未改就不写一条修正进账本：History 上多一行「改过」而区间没动，

@@ -1,6 +1,6 @@
 # 0053 · A phrase decision records the inputs it considered
 
-- **Status**: Implemented 2026-09-23 (#878, migration 0072) · revised 2026-09-26 (migration 0092) · revised 2026-09-27 (#975, migration 0098) · revised 2026-10-17 (#1295, migration 0114) · open: printing the named period (#994 cut 1), derived rows, time resolution's ends (cut 2)
+- **Status**: Implemented 2026-09-23 (#878, migration 0072) · revised 2026-09-26 (migration 0092) · revised 2026-09-27 (#975, migration 0098) · revised 2026-10-17 (#1295, migration 0114) · open: the backfill and printing the named period (#994 cut 1), time resolution's ends (cut 2)
 - **Written**: 2026-09-23
 - **Related**: [0044](0044-the-ontology-is-a-view-over-what-documents-say.md) decision 3; [0051](0051-a-human-phrase-decision-carries-its-materialization-work.md); #807, #795, #801 (withdrawn), #773, #754, #966, #994
 
@@ -277,9 +277,12 @@ the graph page `~ 2025`, the history, document and pending rows `2025-01`, the e
 **The row says so.** The stored instant stays. `facts.end_after_period` (migration 0114) records
 that the end is the instant after the period the text named, and every reader is to print that
 period. A CHECK, `facts_end_after_period_needs_a_stated_end`, keeps it on a dated end the timeline
-did not draw, on a row with a start. A start-less row never gets it in this cut: an end is moved
-only when the row's start lies in the period. Cut 2, when time resolution writes such ends itself,
-replaces the constraint by name without the start clause.
+did not draw, on a row with a start. On the Rust side that rule, with the state property the CHECK
+cannot see, is one function, `graph::period_mark_fits`, which both write entries, `rewrite_end_tx`,
+`mark_end_after_period` and the correction route consult. A start-less row never gets it in this
+cut: an end is moved only when the row's start lies in the period. Cut 2, when time resolution
+writes such ends itself, replaces the constraint by name without the start clause and drops that
+clause from the function.
 
 **Who sets it.** The two places the revision above moves an end:
 
@@ -297,15 +300,16 @@ stays as the person set it, and an end stated at another precision is not rewrit
 2025-01-01 is that day, not the end of 2024).
 
 **Who carries or drops it.** `rewrite_end_tx` writes it in the insert #1054 extended and forces it
-off for a drawn or unknown end and for a start-less row, so the engine's redraws and
-`close_with_unknown_end` never carry it. `rehome_tx` copies it, an errata revision takes it with the
-old row's time, and the same-start branch passes it on when it closes the open row it finds or
-restates the end the timeline drew there. Both write entries drop it where the row cannot carry it:
-an event, an eternal property, no property, no start or no dated end, so a revision onto an event
-drops it. Merges move rows in place; an unmerge moves them in place, or through `rehome_tx` for rows
-rewritten after the merge; the mark stays either way. `close_superseded` writes none, so a close by
-date in Review, a conflict's `close_at` and a violation's `fact_closed` stay stated ends without it;
-those three routes stay outside both cuts.
+off wherever `period_mark_fits` says the row cannot carry it (a drawn or unknown end, a start-less
+row, a property not declared as a state), so the engine's redraws and `close_with_unknown_end` never
+carry it. `rehome_tx` copies it, an errata revision takes it with the old row's time, and the
+same-start branch passes it on when it closes the open row it finds or restates the end the timeline
+drew there. Both write entries drop it where the row cannot carry it: an event, an eternal property,
+no property, no start or no dated end, so a revision onto an event drops it. Merges move rows in
+place; an unmerge moves them in place, or through `rehome_tx` for rows rewritten after the merge;
+the mark stays either way. `close_superseded` writes none, so a close by date in Review, a
+conflict's `close_at` and a violation's `fact_closed` stay stated ends without it; those three
+routes stay outside both cuts.
 
 **Corrections.** `PATCH /api/v1/kbs/{id}/facts/{fact_id}` keeps reading and accepting the stored
 boundary, and the route never translates. The request takes an optional `end_after_period`, the one
@@ -342,37 +346,15 @@ changes, rather than a separate term carrying the named period, as published on 
 recovered: when `endAfterPeriod` is true, it is the end of `validThrough`'s period (`bucket_end`),
 with `validThroughPrecision` for an end below a day.
 
-**Rows written before.** 0114 marks a live typed state row whose start lies in the named period
-and whose source statement states the end one unit earlier at the same precision: an until (a
-statement with only an end), or a single date whose bound binding marks `end`, matched the way
-materialisation matches. A single date marked `start` does not count: "joined in 2024" with "until
-2025" ends in 2025. A single date that also gave the row its start counts only when another source
-statement gives that same start, one that is not itself a single date bound as `end` (the same
-sentence can be stored twice): a binding flipped from `start` to `end` keeps the rows computed
-before (above), while the backfill reads its current value. #994's same-day example ("from
-2023-06-01" with "left on 2023-06-01") is still marked. Left unmarked on purpose: rows with no
-source statement (a nod's, a person's), an implied row refined by a later start, a corrected end, a
-start corrected out of the period, a drawn end, and invalidated rows, so an `as_of` replay prints the
-stored instant. They keep printing the next period until a person edits them once in the dialog. A
-second run changes nothing.
+**Rows written before 0114** stay unmarked until the backfill that follows.
 
 **Limits.**
 
 - Endings that arrive before the start ("until 2025", then "left in 2024", then "works for … from
   2024-03-01") leave the row unmarked on write: the start-less row in between cannot carry the mark,
-  and the refinement copies its end without it. The backfill marks the same shape written before
-  0114. Cut 2's start-less marked rows revisit it.
+  and the refinement copies its end without it. Cut 2's start-less marked rows revisit it.
 - "Left in 2024" and "left in 2025" on a row from 2024-03-01 both close it at 2025-01-01, and in
   either order the row ends up marked: the mark settles the disagreement as 2024.
-
-Open questions on #994, still open:
-
-- Derived rows, asked on 2026-10-15: "Should cut 1 also add the flag to `derived_facts`, set when
-  that end comes from a flagged premise or an event's bucket, or should derived rows wait for a
-  follow-up?" A derivation bounded by a marked premise takes the stored instant, so once the readers
-  print the mark it will name the next period beside a premise that names the stated one.
-- The dialog, asked on 2026-10-17: should a start moved past an untouched end translate that end as
-  the write path would, instead of being refused? The stored end would then move one period later.
 
 Not doing:
 
@@ -399,10 +381,6 @@ Regression coverage, with a real PostgreSQL:
   explicit `false` or `true`, a change of the mark alone counting as a change of the end; refuses an
   explicit `true` without a start, a dated end or a state property; and refuses an interval
   inverted only after truncation.
-- 0114 marks closing, refinement, rule-until and same-day rows, and one whose start a person moved
-  within the period. It leaves unmarked a single date marked `start` with an until, still when the
-  binding flips to `end` with the same sentence stored twice; a corrected end; a person's row. A
-  second run changes nothing.
 
 ## Status history
 
